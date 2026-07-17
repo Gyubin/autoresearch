@@ -1,10 +1,10 @@
-# AutoResearch — 세션 인수인계 (Phase 3~5 이어가기 전 먼저 읽기)
+# AutoResearch — 세션 인수인계 (Phase 4~5 이어가기 전 먼저 읽기)
 
 이 문서는 빈 세션이 이 프로젝트를 이어받기 위한 **단일 진입점**이다. 순서대로
-읽으면 된다: 이 파일 → `docs/BLUEPRINT.md`(설계 근거·Phase 3~5 사양) →
+읽으면 된다: 이 파일 → `docs/BLUEPRINT.md`(설계 근거·Phase 4~5 사양) →
 `README.md`(사용법) → 필요한 코드.
 
-작성 시점: 2026-07-17. Phase 1 + Phase 2 완료.
+작성 시점: 2026-07-17 (Phase 3 반영 갱신). Phase 1 + 2 + 3 완료.
 
 ---
 
@@ -17,48 +17,64 @@
   claude-agent-sdk 뿐. **오케스트레이션은 LangGraph가 아니라 Claude Agent Python
   SDK로 구현** (사용자 확정 결정 — 블루프린트의 LangGraph 추천은 무시).
 - **완료**: Phase 1(제약된 keep/reject 루프) + Phase 2(병렬 포트폴리오 + blind
-  admission gate + LLM 코딩 워커).
-- **다음**: Phase 3(문헌 그라운딩) → 4(방향성 브랜치 정제) → 5(assurance + 보고서).
+  admission gate + LLM 코딩 워커) + Phase 3(claim 수준 문헌 그라운딩 —
+  mock corpus 전용, 이중 모드).
+- **다음**: Phase 4(방향성 브랜치 정제) → 5(assurance + 보고서).
 
 ## 1. 지금 실행해보기
 
 ```bash
 cd /Users/gyubin.son/workspace/dev/autoresearch
 uv sync
-uv run python orchestrator.py status              # 현재 캠페인 상태
-uv run python orchestrator.py verify-protection   # 보호 파일 무결성
-uv run python tests/test_phase2.py                # 단위 드릴 22종
-uv run python orchestrator.py run --generations 2 # 병렬 세대 실행 (휴리스틱, SDK 불필요)
-uv run python orchestrator.py run --generations 1 --proposer claude  # LLM proposer + 코더
-uv run python orchestrator.py report              # test 스플릿 최종 보고 (1회성)
+uv run python orchestrator.py status              # 현재 캠페인 상태 (문헌 통계 포함)
+uv run python orchestrator.py verify-protection   # 보호 파일 무결성 (11개 파일)
+uv run python tests/test_phase2.py                # Phase 2 단위 드릴
+uv run python tests/test_phase3.py                # Phase 3 문헌 드릴
+uv run python orchestrator.py ground              # 연구질문 인증서 (문헌 evidence flow)
+uv run python orchestrator.py run --generations 2 # 병렬 세대 실행 (휴리스틱 + lexical 문헌, SDK 불필요)
+uv run python orchestrator.py run --generations 1 --proposer claude --literature claude  # 전체 LLM 경로
+uv run python orchestrator.py report              # test 스플릿 최종 보고 + 증거 감사 (1회성)
 ```
 
 실행 단위는 라운드가 아니라 **generation**이다. 한 세대에 K개(계약
 `portfolio.parallel_branches`, 기본 4) 가설이 병렬 실행된다. 코더 가설은
-`--proposer claude`일 때만 나온다(휴리스틱은 완전 오프라인·결정적).
+`--proposer claude`일 때만 나온다(휴리스틱은 완전 오프라인·결정적). 문헌
+그라운딩은 계약(`literature.enabled`)이 *여부*를, `--literature {lexical,claude}`
+가 *방법*을 결정한다 — 기본 lexical은 완전 오프라인이다.
 
 ## 2. 파일 지도
 
 | 파일 | 역할 | protected? |
 |---|---|---|
-| `research_contract.yaml` | 타입드 계약 (schema v2: portfolio/gate 블록) | ✅ 불변 |
-| `orchestrator.py` | 코디네이터 + gate + ClaudeCoder + CLI (~1900줄) | ✅ |
+| `research_contract.yaml` | 타입드 계약 (schema v3: portfolio/gate/literature 블록) | ✅ 불변 |
+| `orchestrator.py` | 코디네이터 + gate + ClaudeCoder + 문헌 시임 + CLI (~2900줄) | ✅ |
+| `literature/engine.py` | 문헌 엔진: corpus 검증, LexicalRetriever, EvidenceEngine, ClaudeLiteratureAnalyst, FallbackAnalyst (~950줄, stdlib) | ✅ |
+| `literature/corpus/mock_corpus.json` | 가공 논문 13편/claim 15개 (모순쌍·론더링 트랩·인젝션 픽스처 포함) | ✅ (git 추적) |
 | `evaluation/evaluate.py` | 보호된 평가기 → metrics.json (`--split dev|gate|test`) | ✅ |
 | `evaluation/dataset.py` | 합성 데이터, `load_split`, `SPLIT_SIZES` | ✅ |
 | `evaluation/heldout_config.json` | 숨은 dev/gate/test 시드 (init 생성, **git 미추적**) | — |
 | `src/train.py` | 편집 가능 표면: HYPERPARAMS 블록 + FEATURE_SPEC | 편집 대상 |
-| `protection/hashes.json` | protected 파일 SHA-256 manifest | ✅ (git 추적) |
+| `protection/hashes.json` | protected 파일 SHA-256 manifest (11개) | ✅ (git 추적) |
 | `tests/test_phase2.py` | 단위 드릴 (가드 훅/stagnation/blindness/feature_spec) | — |
-| `experiments/` | 런타임: state.json, ledger.jsonl, rounds/, generations/, report/ | gitignored |
+| `tests/test_phase3.py` | 문헌 드릴 (결정성/blindness canary/론더링/인젝션/계약 v3) | — |
+| `experiments/` | 런타임: state.json, ledger.jsonl, rounds/, generations/, evidence/, report/ | gitignored |
 | `insight_memory.json` | ledger에서 재구성 가능한 파생 교훈 | gitignored |
 | `.worktrees/` | 실험별 격리 worktree | gitignored |
-| `docs/BLUEPRINT.md` | 원본 연구 문서 (Phase 3~5 설계 사양) | — |
+| `docs/BLUEPRINT.md` | 원본 연구 문서 (Phase 4~5 설계 사양) | — |
+| `docs/archive/` | 종료된 캠페인의 ledger/rounds 아카이브 | — |
 
-`orchestrator.py`에서 찾을 것: `load_contract`(계약 v2 파싱), `run_generation`
-(세대 루프), `run_experiment`(가설 1개 워커), `_run_gate`(blind gate),
-`_finish_generation`(원장·머지·상태), `ClaudeCoder` + `_make_worktree_guard`
-(코더 격리), `distill_insight`(blindness 불변식), `replay_ledger_fields`(복구용
-상태 재구성), `recover`(크래시 복구), `cmd_report`(test 스플릿).
+`orchestrator.py`에서 찾을 것: `load_contract`(계약 v3 파싱, literature 블록),
+`run_generation`(세대 루프 — 문헌 grounding→propose→attach→영속화 시임 포함),
+`run_experiment`(가설 1개 워커), `_run_gate`(blind gate), `_finish_generation`
+(원장·머지·상태), `ClaudeCoder` + `_make_worktree_guard`(코더 격리),
+`distill_insight`(blindness 불변식), `replay_ledger_fields`(복구용 상태 재구성),
+`recover`(크래시 복구), `_build_literature`/`_BudgetGuardedLiterature`(문헌
+서비스 구성·캠페인 예산), `cmd_ground`(연구질문 인증서), `cmd_report`(test
+스플릿 + 증거 감사 + 3원 비용 합산). `literature/engine.py`에서 찾을 것:
+`load_corpus`(검증·콘텐츠 정책), `EvidenceEngine.ground/attach`(10단계 플로우·
+단일 권위 증거 작성자), `_hyp_stance`(안티 론더링 규칙), `_coder_family`
+(코더 가설 계열 분류 — 모호하면 포기), `ClaudeLiteratureAnalyst`(LLM 경로,
+supports 강등만 허용).
 
 ## 3. 반드시 보존할 불변식 (깨면 Phase 1+2 보장이 무너진다)
 
@@ -87,6 +103,14 @@ uv run python orchestrator.py report              # test 스플릿 최종 보고
 8. **병렬 안전성**: git 공유 상태 변경(worktree add/remove/prune, branch -D,
    merge)만 `Git._mutation_lock`으로 직렬화. 워커 스레드는 자기 worktree 안 작업만,
    state/ledger에 안 쓴다(전부 배리어 후 메인 스레드). gc.auto=0.
+9. **문헌 엔진 폐포 (Phase 3)**: `literature/`는 orchestrator를 import하지 않고,
+   코퍼스 외 어떤 파일도 읽지 않으며(`ground()` 시그니처가 state·ledger·metrics
+   를 받을 수 없음), **런타임에 아무것도 쓰지 않는다**(protected 경로라 런타임
+   캐시가 생기면 루트 지문이 코더 탈출 오탐으로 캠페인을 중단시킴). 증거는
+   ledger와 **별도**의 `experiments/evidence/evidence.jsonl`에, gate 실행 전
+   시점에만 기록된다. 가설에는 증거 **id만** 실린다(claim 산문은 blindness 스캔
+   표면에 유입 금지). LLM 문헌 판정은 결정적 "supports"를 강등만 할 수 있다.
+   `tests/test_phase3.py`가 이 불변식들을 드릴한다(gate canary 포함).
 
 ## 4. Mock 태스크 (실증 수단)
 
@@ -101,24 +125,25 @@ uv run python orchestrator.py report              # test 스플릿 최종 보고
 실제 연구 도메인으로 교체하거나, 문헌·assurance 레이어를 이 태스크 위에 얹어
 테스트할 수 있다.
 
-## 5. Phase 3~5 진입 지점 (블루프린트 §2, §8 참조)
+## 5. Phase 4~5 진입 지점 (블루프린트 §2, §8 참조)
 
-### Phase 3 — 문헌 그라운딩 (Layer 2)
-목표: evidence graph 서비스. `docs/BLUEPRINT.md`의 evidence record 스키마 +
-검색 flow 10단계 사용. 구현 방향:
-- 새 모듈 `literature/`(별도 통제 서비스 — **문헌 텍스트가 코드·셸 실행 못하게**).
-  PaperQA2 또는 Semantic Scholar/OpenAlex/arXiv API. 오프라인 개발엔 목 코퍼스.
-- 가설 인증서의 `supporting_evidence_ids` / `nearest_prior_work` 필드를 채운다
-  (`Hypothesis` dataclass는 이미 `prior_evidence` 슬롯 있음 — 확장).
-- ProposalContext에 증거를 실어 ClaudeProposer 프롬프트에 근거 추가.
-- 새 메모리: evidence 메모리(ledger와 별도). novelty·모순 보고.
-- **불변식 4(blindness)와 충돌 주의**: 증거는 proposer에 노출 OK, gate 점수는 여전히 금지.
+### Phase 3 — 문헌 그라운딩 (Layer 2) ✅ 완료
+구현됨: `literature/` 별도 통제 서비스(오프라인 mock corpus + `Retriever` 시임),
+이중 모드(결정적 lexical 기본 / `--literature claude` 옵트인 — tools=[] 구조화
+출력 전용, supports 강등만 허용), 가설 인증서 `supporting_evidence_ids`/
+`nearest_prior_work`(id만·화이트리스트 검증), 범주형 novelty(숫자 점수 없음),
+모순 보고, coverage 정지, `ground` 인증서, evidence 메모리(ledger와 별도,
+`experiments/evidence/`), report 증거 감사 + 3원 비용 합산 + 캠페인 문헌 예산.
+적대적 리뷰(4렌즈, 14 발견 → 13 확정 전부 수정) 완주. 남은 것: 실 API 어댑터
+(OpenAlex/S2)는 미구현 — `Retriever` 프로토콜 뒤에 붙이면 된다.
 
 ### Phase 4 — 방향성 브랜치 정제 (Layer 4 심화)
 목표: Gome식 업데이트 + SciNav pairwise. 진입 지점:
 - `run_experiment` 후 실패/성공에서 "업데이트 벡터"(관측→근본원인→방향→bounded
   변경) 추출 → 같은 브랜치의 다음 세대 가설을 편향. `insight_memory`의 momentum을
-  강화.
+  강화. **Phase 3에서 이연한 것**: 증거 기반 heuristic move 조향(현재 문헌은
+  heuristic 가설에 annotation-only — `EvidenceEngine.attach`가 사후 부착만 한다).
+  Gome momentum과 함께 이 단계에서 넣는 것이 자연스럽다.
 - 스칼라 지표가 불충분한 산출물엔 pairwise 평가기 추가(다수 blind 심판, 다른 모델
   계열 권장 — ARIS). `_run_gate`를 pairwise 모드로 확장하거나 병렬 gate 추가.
 - 비용 인지 스케줄링 + successive halving: 값싼 proxy(smoke)로 약한 브랜치 조기
@@ -156,15 +181,18 @@ uv run python orchestrator.py report              # test 스플릿 최종 보고
 - TOCTOU(백그라운드 데몬), 워크스페이스 밖 파일쓰기(탐지는 되나 방지는 아님),
   네트워크는 OS 샌드박스 없이 못 막는다.
 - ClaudeCoder는 **계정 사용량 한도**에 걸릴 수 있다(SDK 에러). 크래시 복구가
-  중단된 세대를 정리하므로 안전하지만, 한도 리셋 후 재개.
-- Phase 3~5는 아직 미구현. 문헌 엔진·claim ledger·cross-model 리뷰어·컨테이너
-  샌드박스 없음.
+  중단된 세대를 정리하므로 안전하지만, 한도 리셋 후 재개. 문헌 LLM 경로는
+  실패 시 lexical로 폴백해 세대를 막지 않는다(`mode` 태그로 기록).
+- 문헌 엔진은 mock corpus 전용(실 API 어댑터는 `Retriever` 시임만). 코더 가설의
+  개입 계열 분류는 키워드 매칭 — 모호하면 분류를 포기한다(unexplored).
+- Phase 4~5는 아직 미구현. claim ledger·cross-model 리뷰어·컨테이너 샌드박스 없음.
 
 ## 8. 새 세션 시작 프롬프트 (예시)
 
-> "이 디렉토리(`~/workspace/dev/autoresearch`)의 AutoResearch 시스템에서 Phase 3
-> (문헌 그라운딩)을 이어서 구현하고 싶어. `docs/HANDOFF.md`와 `docs/BLUEPRINT.md`를
-> 먼저 읽고, 현재 상태를 파악한 뒤 Phase 3 설계안부터 제안해줘."
+> "이 디렉토리(`~/workspace/dev/autoresearch`)의 AutoResearch 시스템에서 Phase 4
+> (방향성 브랜치 정제)를 이어서 구현하고 싶어. `docs/HANDOFF.md`와
+> `docs/BLUEPRINT.md`를 먼저 읽고, 현재 상태를 파악한 뒤 Phase 4 설계안부터
+> 제안해줘."
 
 memory(`autoresearch-project-decisions`)에 구속력 있는 결정이 기록돼 있고 자동
 recall되지만, 위 두 docs가 실제 사양의 원천이다.

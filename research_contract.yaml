@@ -10,8 +10,8 @@
 # To intentionally change the contract: stop all runs, `chmod u+w` the file,
 # edit, then re-run `orchestrator.py init --force` to rebuild the manifest.
 # =============================================================================
-schema_version: 2
-contract_id: autoresearch-phase2-portfolio
+schema_version: 3
+contract_id: autoresearch-phase3-literature
 
 objective: >
   Minimize held-out RMSE of the model trained by src/train.py. Interventions
@@ -43,6 +43,11 @@ protected_globs:
   - "pyproject.toml"
   - "uv.lock"
   - ".python-version"
+  # Phase 3: engine code AND corpus are evidence provenance. The (protected)
+  # orchestrator imports literature/engine.py, so an unprotected engine
+  # would be an integrity hole in the trusted path; a mutable corpus would
+  # let evidence drift mid-campaign (citation fraud).
+  - "literature/**"
 
 budgets:
   # Must match the hardcoded values in evaluation/evaluate.py; the evaluator
@@ -74,3 +79,24 @@ portfolio:
 stop_conditions:
   # Consecutive generations without an admitted winner.
   stagnation_generations: 4
+
+literature:
+  # Phase 3 literature grounding (Blueprint Layer 2). The corpus is an
+  # offline mock (fictional claim-level evidence over this task's
+  # intervention space); the retrieval backend is swappable for a real
+  # OpenAlex/S2 adapter later. Literature NEVER touches scoring: the
+  # evaluator does not read this block and no evidence flows gate-ward.
+  enabled: true
+  corpus_path: "literature/corpus/mock_corpus.json"
+  retriever: lexical
+  max_evidence_per_generation: 12
+  max_evidence_per_hypothesis: 4
+  max_queries: 6
+  # Coverage stop: consecutive queries contributing zero new evidence.
+  stabilization_window: 2
+  citation_hops: 1
+  # Per-grounding-call cap (SDK-enforced) and optional campaign total
+  # (enforced by summing experiments/evidence/evidence.jsonl; exhaustion
+  # degrades to lexical grounding, mode "claude+budget_exhausted").
+  llm_max_budget_usd: 0.5
+  llm_max_campaign_budget_usd: null

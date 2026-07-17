@@ -61,6 +61,12 @@ from typing import Any, Optional
 
 import yaml
 
+# The literature service (Phase 3) is a separate, protected module: pure
+# stdlib at import time (its LLM path lazy-imports the SDK), no orchestrator
+# import on its side, and it never reads experiments/ or state.
+from literature.engine import (ANTI_INJECTION_SENTENCE, CorpusError,
+                               build_engine, load_corpus)
+
 # ---------------------------------------------------------------------------
 # Paths and constants
 # ---------------------------------------------------------------------------
@@ -77,6 +83,11 @@ ROUNDS_DIR = EXPERIMENTS_DIR / "rounds"
 BASELINE_DIR = EXPERIMENTS_DIR / "baseline"
 STATE_PATH = EXPERIMENTS_DIR / "state.json"
 LEDGER_PATH = EXPERIMENTS_DIR / "ledger.jsonl"
+# Phase 3 evidence memory: separate from the ledger by design (HANDOFF §5),
+# so replay/recovery over ledger.jsonl never has to know about evidence.
+EVIDENCE_DIR = EXPERIMENTS_DIR / "evidence"
+EVIDENCE_LOG_PATH = EVIDENCE_DIR / "evidence.jsonl"
+QUESTION_CERT_PATH = EVIDENCE_DIR / "question_certificate.json"
 INSIGHTS_PATH = ROOT / "insight_memory.json"
 WORKTREES_DIR = ROOT / ".worktrees"
 # Outside experiments/ so `init --force` (which clears experiments/) can never
@@ -262,6 +273,20 @@ class Portfolio:
 
 
 @dataclass(frozen=True)
+class Literature:
+    enabled: bool
+    corpus_path: str
+    retriever: str
+    max_evidence_per_generation: int
+    max_evidence_per_hypothesis: int
+    max_queries: int
+    stabilization_window: int
+    citation_hops: int
+    llm_max_budget_usd: float
+    llm_max_campaign_budget_usd: float | None
+
+
+@dataclass(frozen=True)
 class ResearchContract:
     schema_version: int
     contract_id: str
@@ -273,6 +298,7 @@ class ResearchContract:
     budgets: Budgets
     portfolio: Portfolio
     stop_conditions: StopConditions
+    literature: Literature
 
 
 def _require(mapping: dict, key: str, kind: type | tuple, ctx: str) -> Any:
@@ -304,9 +330,9 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         raise ContractError("contract root must be a mapping")
 
     schema_version = _require(raw, "schema_version", int, "")
-    if schema_version != 2:
+    if schema_version != 3:
         raise ContractError(f"unsupported contract schema_version {schema_version} "
-                            f"(this orchestrator expects 2)")
+                            f"(this orchestrator expects 3)")
 
     pm_raw = _require(raw, "primary_metric", dict, "")
     direction = _require(pm_raw, "direction", str, "primary_metric")
@@ -369,6 +395,64 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
             "portfolio.gate_min_relative_improvement must be in [0, 1)"
         )
 
+    lit_raw = _require(raw, "literature", dict, "")
+    corpus_path = _require(lit_raw, "corpus_path", str, "literature")
+    if corpus_path.startswith("/") or \
+            ".." in PurePosixPath(corpus_path).parts:
+        # The glob below happily matches "literature/../evaluation/x", so
+        # kill traversal and absolute paths before it.
+        raise ContractError(
+            "literature.corpus_path must be repo-relative without '..'")
+    if not matches_any(corpus_path, ("literature/**",)):
+        # The engine reads whatever path it is given, so constrain it at the
+        # contract layer: pointing the "corpus" at evaluation/** (hidden
+        # seeds) or any other tree must be unrepresentable.
+        raise ContractError(
+            "literature.corpus_path must live under literature/**")
+    retriever = lit_raw.get("retriever", "lexical")
+    if retriever != "lexical":
+        raise ContractError(
+            f"literature.retriever {retriever!r} is not implemented "
+            f"(Phase 3 supports: lexical)")
+    campaign_cap = lit_raw.get("llm_max_campaign_budget_usd")
+    if campaign_cap is not None and (
+        isinstance(campaign_cap, bool)
+        or not isinstance(campaign_cap, (int, float)) or campaign_cap <= 0
+    ):
+        raise ContractError(
+            "literature.llm_max_campaign_budget_usd must be a positive "
+            "number or null")
+    literature = Literature(
+        enabled=_require(lit_raw, "enabled", bool, "literature"),
+        corpus_path=corpus_path,
+        retriever=retriever,
+        max_evidence_per_generation=_require(
+            lit_raw, "max_evidence_per_generation", int, "literature"),
+        max_evidence_per_hypothesis=_require(
+            lit_raw, "max_evidence_per_hypothesis", int, "literature"),
+        max_queries=_require(lit_raw, "max_queries", int, "literature"),
+        stabilization_window=_require(
+            lit_raw, "stabilization_window", int, "literature"),
+        citation_hops=_require(lit_raw, "citation_hops", int, "literature"),
+        llm_max_budget_usd=float(_require(
+            lit_raw, "llm_max_budget_usd", (int, float), "literature")),
+        llm_max_campaign_budget_usd=(
+            float(campaign_cap) if campaign_cap is not None else None),
+    )
+    if min(literature.max_evidence_per_generation,
+           literature.max_evidence_per_hypothesis,
+           literature.max_queries, literature.stabilization_window) <= 0:
+        raise ContractError("literature counts must be positive")
+    if literature.max_evidence_per_hypothesis > \
+            literature.max_evidence_per_generation:
+        raise ContractError(
+            "literature.max_evidence_per_hypothesis cannot exceed "
+            "max_evidence_per_generation")
+    if not 0 <= literature.citation_hops <= 2:
+        raise ContractError("literature.citation_hops must be in [0, 2]")
+    if literature.llm_max_budget_usd <= 0:
+        raise ContractError("literature.llm_max_budget_usd must be positive")
+
     return ResearchContract(
         schema_version=schema_version,
         contract_id=_require(raw, "contract_id", str, ""),
@@ -384,6 +468,7 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         budgets=budgets,
         portfolio=portfolio,
         stop_conditions=stop,
+        literature=literature,
     )
 
 
@@ -613,6 +698,12 @@ class Hypothesis:
     executor: str = "patcher"  # "patcher" | "coder"
     implementation_brief: str = ""  # coder-only: what to build under src/**
     prior_evidence: list[str] = field(default_factory=list)
+    # Literature grounding (Phase 3): ids ONLY, never claim text — the
+    # hypothesis is serialized into ledger records and prompts, and the
+    # blindness literal-scan surface must not grow literature prose.
+    # prior_evidence keeps meaning insight ids (separate memory).
+    supporting_evidence_ids: list[str] = field(default_factory=list)
+    nearest_prior_work: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -732,6 +823,9 @@ class ProposalContext:
     tested: dict[str, list[str]]
     last_accepted: dict | None
     insights: list[dict]
+    # Phase 3: compact literature evidence records (proposer view). Data,
+    # not instructions; empty when literature is disabled.
+    evidence: list[dict] = field(default_factory=list)
 
 
 _MECHANISMS = {
@@ -880,8 +974,16 @@ class ClaudeProposer:
         self.max_budget_usd = max_budget_usd
         self.last_cost_usd: float | None = None
 
-    def _schema(self, hp: dict, k: int, allow_coder: bool) -> dict:
+    def _schema(self, hp: dict, k: int, allow_coder: bool,
+                evidence_ids: list[str]) -> dict:
         executors = ["patcher", "coder"] if allow_coder else ["patcher"]
+        # When evidence exists, the id enum makes fabricated citations
+        # unrepresentable. Guard the empty case: the SDK's strict-mode
+        # validator must never see `"enum": []`.
+        cited = {"type": "array",
+                 "items": ({"type": "string", "enum": sorted(evidence_ids)}
+                           if evidence_ids else {"type": "string"}),
+                 "maxItems": 8}
         item = {
             "type": "object",
             "properties": {
@@ -898,10 +1000,12 @@ class ClaudeProposer:
                                                    {"type": "null"}]},
                 "predicted_effect": {"type": "string"},
                 "falsifier": {"type": "string"},
+                "supporting_evidence_ids": cited,
             },
             "required": ["statement", "mechanism", "executor", "param",
                          "new_value", "implementation_brief",
-                         "predicted_effect", "falsifier"],
+                         "predicted_effect", "falsifier",
+                         "supporting_evidence_ids"],
             "additionalProperties": False,
         }
         return {
@@ -939,6 +1043,16 @@ class ClaudeProposer:
             *tested_lines,
             "Distilled insights from past rounds:",
             json.dumps(insights, indent=2) if insights else "  (none yet)",
+            *([
+                "Literature evidence for this generation. "
+                + ANTI_INJECTION_SENTENCE,
+                "```json\n" + json.dumps(ctx.evidence, indent=1) + "\n```",
+                "Cite, per hypothesis, the evidence_ids from the list above "
+                "(ONLY those ids) that genuinely support its mechanism in "
+                "supporting_evidence_ids — an empty list is correct when "
+                "nothing applies. Where evidence contradicts a move, avoid "
+                "it or address the contradiction in mechanism/falsifier.",
+            ] if ctx.evidence else []),
             f"Propose UP TO {k} scientifically DIVERSE hypotheses for one "
             f"portfolio generation. Rules:\n"
             f"- executor='patcher': change exactly ONE hyperparameter to ONE "
@@ -1004,6 +1118,12 @@ class ClaudeProposer:
         """Returns a Hypothesis or an error string."""
         hp = ctx.current_hyperparams
         executor = raw.get("executor")
+        # Whitelist-intersect cited evidence (defense in depth behind the
+        # schema enum). Hallucinated citations are dropped, never fatal —
+        # bogus ids must not be able to DoS the whole proposal batch.
+        pack_ids = {e.get("evidence_id") for e in ctx.evidence}
+        cited_evidence = [c for c in (raw.get("supporting_evidence_ids") or [])
+                          if isinstance(c, str) and c in pack_ids]
 
         if executor == "coder":
             if coder_count >= max_coder:
@@ -1026,6 +1146,7 @@ class ClaudeProposer:
                 implementation_brief=brief.strip(),
                 prior_evidence=[i["insight_id"] for i in ctx.insights[-3:]
                                 if "insight_id" in i],
+                supporting_evidence_ids=cited_evidence,
             )
 
         param = raw.get("param")
@@ -1066,11 +1187,14 @@ class ClaudeProposer:
             executor="patcher",
             prior_evidence=[i["insight_id"] for i in ctx.insights[-3:]
                             if "insight_id" in i],
+            supporting_evidence_ids=cited_evidence,
         )
 
     def propose_batch(self, ctx: ProposalContext, k: int) -> list[Hypothesis]:
         max_coder = ctx.contract.portfolio.max_coder_hypotheses
-        schema = self._schema(ctx.current_hyperparams, k, max_coder > 0)
+        schema = self._schema(ctx.current_hyperparams, k, max_coder > 0,
+                              [str(e["evidence_id"]) for e in ctx.evidence
+                               if e.get("evidence_id")])
         feedback: str | None = None
         for _ in range(2):  # one whole-batch retry with per-item feedback
             raw = self._query(self._prompt(ctx, k, max_coder, feedback), schema)
@@ -1286,6 +1410,7 @@ class ClaudeCoder:
         return asyncio.run(go())
 
     def _initial_prompt(self, hypothesis: Hypothesis, context: dict) -> str:
+        evidence = context.get("evidence") or []
         return "\n\n".join([
             f"Hypothesis to implement:\n{json.dumps(hypothesis.to_dict(), indent=2)}",
             f"Implementation brief:\n{hypothesis.implementation_brief}",
@@ -1293,6 +1418,11 @@ class ClaudeCoder:
             f"{json.dumps(context.get('dev_summary') or {})}",
             f"Recent distilled insights:\n"
             f"{json.dumps(context.get('insights') or [], indent=2)}",
+            *([
+                "Supporting literature evidence for this hypothesis. "
+                + ANTI_INJECTION_SENTENCE,
+                "```json\n" + json.dumps(evidence, indent=1) + "\n```",
+            ] if evidence else []),
             "The trainer is src/train.py (read it first). Acceptance: the "
             "smoke evaluation (AUTORESEARCH_SMOKE=1, 20s) and the dev "
             "evaluation (90s) must run your code to a valid "
@@ -1315,7 +1445,7 @@ class ClaudeCoder:
         }
 
     def repair(self, worktree: Path, hypothesis: Hypothesis,
-               session_id: str | None, failure_class: str,
+               context: dict, session_id: str | None, failure_class: str,
                stderr_tail: str) -> dict:
         denials: list[dict] = []
         prompt = (
@@ -1330,9 +1460,10 @@ class ClaudeCoder:
                                                      resume=session_id))
         except Exception:
             # Session resume can fail (persistence off / GC'd) — fall back to
-            # a fresh call carrying the brief again.
+            # a fresh call carrying the brief again, with the same context
+            # packet (insights + evidence) the original session saw.
             result = self._run(
-                f"{self._initial_prompt(hypothesis, {})}\n\n{prompt}",
+                f"{self._initial_prompt(hypothesis, context)}\n\n{prompt}",
                 self._options(worktree, denials),
             )
         if result.is_error:
@@ -1640,6 +1771,9 @@ class LoopContext:
     patcher: HyperparamsPatcher
     proposer: Any
     coder: ClaudeCoder | None = None
+    # Phase 3 literature service (EvidenceEngine or FallbackAnalyst);
+    # None when contract.literature.enabled is false.
+    literature: Any | None = None
 
 
 @dataclass
@@ -1652,6 +1786,9 @@ class ExperimentSpec:
     round_dir: Path
     base_commit: str
     insights: list[dict] = field(default_factory=list)
+    # Full evidence records cited by this spec's hypothesis (supports-only
+    # by construction of EvidenceEngine.attach) — the coder packet slice.
+    evidence: list[dict] = field(default_factory=list)
 
 
 # Smoke-stage failure classes meaning "no scoreable model was ever produced"
@@ -1857,7 +1994,8 @@ def run_experiment(ctx: LoopContext, spec: ExperimentSpec,
         root_before = _root_fingerprint(ctx)
         try:
             coder_result = ctx.coder.execute(
-                spec.worktree, hyp, {"insights": spec.insights},
+                spec.worktree, hyp,
+                {"insights": spec.insights, "evidence": spec.evidence},
             )
         except CoderError as exc:
             _assert_root_unchanged(spec.run_id, root_before,
@@ -1934,7 +2072,9 @@ def run_experiment(ctx: LoopContext, spec: ExperimentSpec,
         root_before = _root_fingerprint(ctx)
         try:
             repair_result = ctx.coder.repair(
-                spec.worktree, hyp, session_id,
+                spec.worktree, hyp,
+                {"insights": spec.insights, "evidence": spec.evidence},
+                session_id,
                 str(smoke.get("failure_class")),
                 str(smoke.get("stderr_tail") or ""),
             )
@@ -2122,26 +2262,47 @@ def run_generation(ctx: LoopContext, state: dict) -> dict | None:
 
     generation = state.get("generation", 0) + 1
     insights = read_insights()
+    current_hyperparams = ctx.patcher.read(ROOT / TRAIN_REL)
+    grounding = None
+    if ctx.literature is not None:
+        # Literature grounding: main thread, pre-proposal, pre-gate. The
+        # engine's input closure is gate-free by signature (invariant 4):
+        # objective / hyperparams / insights / dev incumbent / tested only.
+        grounding = ctx.literature.ground(
+            objective=contract.objective,
+            hyperparams=current_hyperparams,
+            insights=insights,
+            best_primary_dev=state.get("best_primary"),
+            tested=state.get("tested", {}),
+        )
     batch = ctx.proposer.propose_batch(ProposalContext(
         contract=contract,
         round_index=state["round"] + 1,
-        current_hyperparams=ctx.patcher.read(ROOT / TRAIN_REL),
+        current_hyperparams=current_hyperparams,
         best_primary=state.get("best_primary"),
         tested=state.get("tested", {}),
         last_accepted=state.get("last_accepted"),
         insights=insights,
+        evidence=grounding.proposer_view() if grounding is not None else [],
     ), k_budget)
     if not batch:
         return None
 
     campaign = state.get("campaign_id", "c0")
     base_commit = ctx.git.head()
-    specs: list[ExperimentSpec] = []
     for i, hyp in enumerate(batch):
         rnum = state["round"] + 1 + i
-        run_id = f"r{rnum:04d}"
         hyp.round = rnum
-        hyp.id = f"h_{run_id}_{_slug(hyp)}"
+        hyp.id = f"h_r{rnum:04d}_{_slug(hyp)}"
+    if grounding is not None and ctx.literature is not None:
+        # Single authoritative writer of supporting_evidence_ids /
+        # nearest_prior_work + per-hypothesis novelty. Runs after final
+        # hypothesis ids are assigned so novelty reports key on the ids
+        # that hypothesis.json and the ledger will carry.
+        ctx.literature.attach(batch, grounding)
+    specs: list[ExperimentSpec] = []
+    for hyp in batch:
+        run_id = f"r{hyp.round:04d}"
         specs.append(ExperimentSpec(
             run_id=run_id,
             generation=generation,
@@ -2151,6 +2312,8 @@ def run_generation(ctx: LoopContext, state: dict) -> dict | None:
             round_dir=ROUNDS_DIR / run_id,
             base_commit=base_commit,
             insights=insights[-5:],
+            evidence=(grounding.for_hypothesis(hyp)
+                      if grounding is not None else []),
         ))
 
     # Write-ahead point 1: reserve the contiguous rNNNN block + generation
@@ -2169,6 +2332,21 @@ def run_generation(ctx: LoopContext, state: dict) -> dict | None:
         spec.round_dir.mkdir(parents=True, exist_ok=True)
         atomic_write_json(spec.round_dir / "hypothesis.json",
                           spec.hypothesis.to_dict())
+    if grounding is not None:
+        # Evidence memory — separate from the ledger by design. The
+        # per-generation snapshot is an idempotent overwrite (a fully
+        # aborted generation reuses its number on the next attempt); the
+        # append-only jsonl keeps every attempt distinguishable by
+        # timestamp. Written before any gate work exists for this
+        # generation, so gate scores cannot appear here even in principle.
+        bundle = grounding.to_bundle()
+        bundle.update(kind="generation_grounding", generation=generation,
+                      timestamp_utc=utc_now())
+        gen_dir = EXPERIMENTS_DIR / "generations" / f"g{generation:04d}"
+        gen_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(gen_dir / "evidence.json", bundle)
+        EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+        append_jsonl(EVIDENCE_LOG_PATH, bundle)
 
     # Serial worktree creation: worktree add mutates shared .git admin state.
     for spec in specs:
@@ -2380,9 +2558,22 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     required = [CONTRACT_PATH, EVALUATOR_PATH, ROOT / "evaluation" / "dataset.py",
                 ROOT / TRAIN_REL, ROOT / ".gitignore", ROOT / "pyproject.toml"]
+    if contract.literature.enabled:
+        required.append(ROOT / contract.literature.corpus_path)
     for path in required:
         if not path.is_file():
             raise OrchestratorError(f"required file missing: {path}")
+
+    if contract.literature.enabled:
+        # Fail fast on a corrupt corpus: a silently skipped literature layer
+        # would fake the campaign's grounding provenance.
+        try:
+            corpus = load_corpus(ROOT / contract.literature.corpus_path)
+        except CorpusError as exc:
+            raise ContractError(f"literature corpus invalid: {exc}") from None
+        print(f"[init] literature corpus {corpus.corpus_id}: "
+              f"{len(corpus.papers)} papers, {len(corpus.claims)} claims "
+              f"(sha256 {corpus.sha256[:12]})")
 
     declared = _load_evaluator_declarations()
     if (declared["budgets"].get("smoke") != contract.budgets.smoke_train_timeout_s
@@ -2500,6 +2691,63 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+class _BudgetGuardedLiterature:
+    """Campaign-level LLM literature budget, enforced by summing the
+    evidence log — the orchestrator's own memory. (The engine itself never
+    reads experiments/; that closure is part of the blindness proof, so the
+    budget check lives here, not in literature/.)"""
+
+    def __init__(self, primary: Any, fallback: Any,
+                 campaign_cap: float | None) -> None:
+        self.primary = primary
+        self.fallback = fallback
+        self.campaign_cap = campaign_cap
+
+    def ground(self, **kwargs: Any) -> Any:
+        if self.campaign_cap is not None:
+            spent = sum(rec.get("cost_usd") or 0.0
+                        for rec in read_jsonl(EVIDENCE_LOG_PATH))
+            if spent >= self.campaign_cap:
+                print(f"[literature] campaign LLM budget exhausted "
+                      f"(${spent:.2f} >= ${self.campaign_cap:.2f}); "
+                      f"grounding lexically", file=sys.stderr)
+                grounding = self.fallback.ground(**kwargs)
+                grounding.mode = "claude+budget_exhausted"
+                return grounding
+        return self.primary.ground(**kwargs)
+
+    def attach(self, hypotheses: list, grounding: Any) -> None:
+        self.fallback.attach(hypotheses, grounding)
+
+    def question_certificate(self, grounding: Any) -> dict:
+        return self.fallback.question_certificate(grounding)
+
+
+def _build_literature(args: argparse.Namespace,
+                      contract: ResearchContract) -> Any | None:
+    """None when the contract disables literature; the contract decides
+    WHETHER a campaign is grounded, the CLI only decides HOW."""
+    mode = getattr(args, "literature", "lexical") or "lexical"
+    if not contract.literature.enabled:
+        if mode == "claude":
+            print("[literature] contract literature.enabled is false; "
+                  "--literature claude ignored", file=sys.stderr)
+        return None
+    try:
+        engine = build_engine(contract.literature, "lexical",
+                              corpus_root=ROOT)
+        if mode != "claude":
+            return engine
+        primary = build_engine(contract.literature, "claude",
+                               model=getattr(args, "model", None),
+                               corpus_root=ROOT)
+    except CorpusError as exc:
+        raise OrchestratorError(
+            f"literature corpus unavailable: {exc}") from None
+    return _BudgetGuardedLiterature(
+        primary, engine, contract.literature.llm_max_campaign_budget_usd)
+
+
 def build_context(args: argparse.Namespace, contract: ResearchContract,
                   git: Git, guard: ProtectionGuard) -> LoopContext:
     heuristic = HeuristicProposer()
@@ -2517,7 +2765,7 @@ def build_context(args: argparse.Namespace, contract: ResearchContract,
         coder = ClaudeCoder(contract, model=args.model)
     return LoopContext(contract=contract, git=git, guard=guard,
                        patcher=HyperparamsPatcher(), proposer=proposer,
-                       coder=coder)
+                       coder=coder, literature=_build_literature(args, contract))
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -2648,6 +2896,24 @@ def cmd_status(_: argparse.Namespace) -> int:
             print(f"  g{g.get('generation', 0):04d}: candidates "
                   f"{g.get('candidates')} -> "
                   f"{g.get('winner') or 'no winner'}")
+    bundles = read_jsonl(EVIDENCE_LOG_PATH)
+    if bundles:
+        last = bundles[-1]
+        stances: dict[str, int] = {}
+        for rec in last.get("evidence") or []:
+            stance = str(rec.get("stance"))
+            stances[stance] = stances.get(stance, 0) + 1
+        novelty: dict[str, int] = {}
+        per_hyp = (last.get("novelty") or {}).get("per_hypothesis") or {}
+        for rep in per_hyp.values():
+            cat = str(rep.get("novelty_category"))
+            novelty[cat] = novelty.get(cat, 0) + 1
+        coverage = last.get("coverage") or {}
+        print(f"\nliterature: {len(bundles)} grounding event(s), corpus "
+              f"{last.get('corpus_id')} ({str(last.get('corpus_sha256'))[:12]})")
+        print(f"  last: mode={last.get('mode')}  stances={stances}  "
+              f"novelty={novelty or '(pre-proposal)'}  "
+              f"stop={coverage.get('stopped_because')}")
     return 0
 
 
@@ -2741,9 +3007,80 @@ def cmd_report(args: argparse.Namespace) -> int:
         "stop_state": {"stagnation": state.get("stagnation"),
                        "round": state.get("round")},
     }
+
+    # Phase 3: evidence audit — every accepted hypothesis's citation must
+    # resolve to a concrete (paper, claim, locator); an unresolvable id is
+    # citation fraud and fails the report hard.
+    bundles = read_jsonl(EVIDENCE_LOG_PATH)
+    evidence_index: dict[str, dict] = {}
+    for bundle in bundles:
+        for rec in bundle.get("evidence") or []:
+            evidence_index[rec["evidence_id"]] = rec
+    audit = []
+    for r in experiments:
+        if r.get("decision") != "accept":
+            continue
+        for evidence_id in (r.get("hypothesis") or {}).get(
+                "supporting_evidence_ids") or []:
+            rec = evidence_index.get(evidence_id)
+            if rec is None:
+                raise OrchestratorError(
+                    f"evidence audit failed: {r.get('run_id')} cites "
+                    f"{evidence_id} but no grounding record resolves it")
+            audit.append({"run_id": r.get("run_id"),
+                          "evidence_id": evidence_id,
+                          "paper_id": rec.get("canonical_paper_id"),
+                          "claim": rec.get("claim"),
+                          "locator": rec.get("locator")})
+    report["literature"] = {
+        "corpus_id": bundles[-1].get("corpus_id") if bundles else None,
+        "corpus_sha256": bundles[-1].get("corpus_sha256") if bundles else None,
+        "grounding_events": len(bundles),
+        "evidence_records": len(evidence_index),
+        "contradictions_surfaced": len({
+            json.dumps(c, sort_keys=True)
+            for b in bundles for c in b.get("contradictions") or []}),
+        "evidence_audit": audit,
+    } if bundles else None
+    # Cost aggregation across all three LLM spend sources.
+    costs = {
+        "proposal_usd": round(sum(r.get("proposal_cost_usd") or 0.0
+                                  for r in experiments), 4),
+        "coder_usd": round(sum((r.get("coder") or {}).get("cost_usd") or 0.0
+                               for r in experiments), 4),
+        "literature_usd": round(sum(b.get("cost_usd") or 0.0
+                                    for b in bundles), 4),
+    }
+    costs["total_usd"] = round(sum(costs.values()), 4)
+    report["costs"] = costs
+
     append_jsonl(LEDGER_PATH, report)
     atomic_write_json(report_dir / "report.json", report)
     print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_ground(args: argparse.Namespace) -> int:
+    """One-shot research-question grounding certificate (Blueprint Layer 2
+    output). Runs the evidence flow against the contract objective (no
+    hypotheses) and persists the certificate under experiments/evidence/."""
+    contract = load_contract()
+    if not contract.literature.enabled:
+        raise OrchestratorError("literature is disabled in the contract")
+    service = _build_literature(args, contract)
+    if service is None:
+        raise OrchestratorError("literature service unavailable")
+    hyperparams = HyperparamsPatcher.read(ROOT / TRAIN_REL)
+    grounding = service.ground(
+        objective=contract.objective, hyperparams=hyperparams,
+        insights=read_insights(), best_primary_dev=None, tested={})
+    certificate = service.question_certificate(grounding)
+    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(QUESTION_CERT_PATH, certificate)
+    bundle = grounding.to_bundle()
+    bundle.update(kind="question_grounding", timestamp_utc=utc_now())
+    append_jsonl(EVIDENCE_LOG_PATH, bundle)
+    print(json.dumps(certificate, indent=2, sort_keys=True))
     return 0
 
 
@@ -2778,6 +3115,10 @@ def main() -> int:
                        help="model override for the claude proposer/coder")
     p_run.add_argument("--max-budget-usd", type=float, default=0.5,
                        help="per-proposal budget cap for the claude proposer")
+    p_run.add_argument("--literature", choices=("lexical", "claude"),
+                       default="lexical",
+                       help="literature grounding mode (contract decides "
+                            "WHETHER, this decides HOW)")
     p_run.set_defaults(fn=cmd_run)
 
     p_status = sub.add_parser("status", help="show campaign state")
@@ -2790,13 +3131,22 @@ def main() -> int:
                                "in the multiple-testing disclosure)")
     p_report.set_defaults(fn=cmd_report)
 
+    p_ground = sub.add_parser("ground",
+                              help="one-shot research-question grounding "
+                                   "certificate (literature evidence flow)")
+    p_ground.add_argument("--literature", choices=("lexical", "claude"),
+                          default="lexical")
+    p_ground.add_argument("--model", default=None,
+                          help="model override for the claude analyst")
+    p_ground.set_defaults(fn=cmd_ground)
+
     p_verify = sub.add_parser("verify-protection",
                               help="check protected files against the manifest")
     p_verify.set_defaults(fn=cmd_verify_protection)
 
     args = parser.parse_args()
     try:
-        if args.command in ("init", "run", "report"):
+        if args.command in ("init", "run", "report", "ground"):
             with InstanceLock(LOCK_PATH):
                 return args.fn(args)
         return args.fn(args)
