@@ -427,6 +427,106 @@ def test_explore_slots() -> None:
 
 
 # ---------------------------------------------------------------------------
+# H1 — halving cut: determinism, ties, floors, non-scoreable exclusion
+# ---------------------------------------------------------------------------
+
+def _smoke_rec(rid: str, smoke, verdict=None) -> dict:
+    return {"run_id": rid, "verdict": verdict, "smoke_primary": smoke,
+            "smoke_metrics_path": f"experiments/rounds/{rid}/metrics_smoke.json"}
+
+
+def test_halving_cut() -> None:
+    halving = orch.Halving(enabled=True, keep_fraction=0.5, min_keep=2)
+    records = [
+        _smoke_rec("r0001", 0.40), _smoke_rec("r0002", 0.39),
+        _smoke_rec("r0003", 0.39), _smoke_rec("r0004", 0.45),
+        _smoke_rec("r0005", None, verdict="invalid_implementation"),
+        _smoke_rec("r0006", 0.50), _smoke_rec("r0007", 0.41),
+        _smoke_rec("r0008", None, verdict="valid_negative"),
+    ]
+    survivors = orch._apply_halving(records, halving, direction="minimize")
+    check("halving: rank cut keeps ceil(K*f) best smoke scores",
+          survivors == {"r0001", "r0002", "r0003", "r0007"},
+          json.dumps(sorted(survivors)))
+    check("halving: deterministic across recomputation",
+          survivors == orch._apply_halving(list(reversed(records)), halving,
+                                           direction="minimize"))
+    check("halving: non-scoreable records never survive",
+          not survivors & {"r0005", "r0008"})
+
+    tie = [_smoke_rec("r0002", 0.39), _smoke_rec("r0001", 0.39),
+           _smoke_rec("r0003", 0.40)]
+    got = orch._apply_halving(
+        tie, orch.Halving(enabled=True, keep_fraction=0.5, min_keep=1),
+        direction="minimize")
+    check("halving: score ties break by run_id", got == {"r0001", "r0002"})
+
+    floor = orch._apply_halving(
+        records, orch.Halving(enabled=True, keep_fraction=0.1, min_keep=2),
+        direction="minimize")
+    check("halving: min_keep floors the survivor count",
+          floor == {"r0002", "r0003"})
+
+    maxi = orch._apply_halving(tie, orch.Halving(enabled=True,
+                                                 keep_fraction=0.5,
+                                                 min_keep=1),
+                               direction="maximize")
+    check("halving: maximize keeps the highest smoke scores",
+          maxi == {"r0003", "r0001"} or maxi == {"r0003", "r0002"},
+          json.dumps(sorted(maxi)))
+
+    few = orch._apply_halving([_smoke_rec("r0001", 0.4)], halving,
+                              direction="minimize")
+    check("halving: fewer scoreable than keep -> all scoreable survive",
+          few == {"r0001"})
+
+
+# ---------------------------------------------------------------------------
+# H2 — pruned semantics: budget decision, not science
+# ---------------------------------------------------------------------------
+
+def test_pruned_semantics() -> None:
+    record = exp("r0011", 3, "lr", 0.005, 0.0125, None, "reject",
+                 primary=None)
+    record["smoke_primary"] = 0.41
+    record["smoke_metrics_path"] = "experiments/rounds/r0011/metrics_smoke.json"
+    orch._prune_record(record)
+    check("pruned: record fields set by _prune_record",
+          record["verdict"] == "pruned"
+          and record["failure_class"] == "smoke_rank_below_cutoff"
+          and record["primary"] is None
+          and record["metrics_path"] == record["smoke_metrics_path"])
+    check("pruned: distill_insight yields no insight",
+          orch.distill_insight(record) is None)
+    check("pruned: zero search-momentum weight",
+          orch._momentum_weight({"verdict": "pruned",
+                                 "decision": "reject"}) == (0.0, None))
+    check("pruned: never a repairable failure class",
+          "smoke_rank_below_cutoff" not in orch.MECHANICAL_FAILURES)
+
+    # Replay: a pruned-heavy generation counts exactly like any winnerless
+    # generation, and pruned endpoints ARE registered as tested.
+    gen = [
+        exp("r0012", 4, "epochs", 30, 60, "valid_inconclusive", "reject"),
+        dict(record, run_id="r0013", generation=4),
+    ]
+    state: dict = {}
+    orch.replay_ledger_fields(state, gen)
+    check("pruned: winnerless generation counts one stagnation",
+          state["stagnation"] == 1)
+    check("pruned: endpoints registered as tested (replay path)",
+          set(state["tested"].get("lr", [])) == {"0.005", "0.0125"})
+
+    with_winner = gen + [exp("r0014", 4, "l2", 0.0, 0.001,
+                             "valid_positive", "accept")]
+    state2: dict = {}
+    orch.replay_ledger_fields(state2, with_winner)
+    check("pruned: does not mask a generation's winner",
+          state2["stagnation"] == 0
+          and state2["last_accepted"]["param"] == "l2")
+
+
+# ---------------------------------------------------------------------------
 # C — contract v4 validation
 # ---------------------------------------------------------------------------
 
@@ -512,6 +612,8 @@ def main() -> int:
         test_legacy_equivalence()
         test_value_progression()
         test_explore_slots()
+        test_halving_cut()
+        test_pruned_semantics()
         test_contract_v4(tmp)
 
     print()

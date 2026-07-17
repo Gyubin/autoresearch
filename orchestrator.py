@@ -1959,6 +1959,12 @@ def distill_insight(record: dict) -> dict | None:
     before = record.get("best_primary_before")
     primary = record.get("primary")
 
+    if verdict == "pruned":
+        # Phase 4b: halving elimination is a BUDGET decision on the noisy
+        # smoke proxy, not scientific evidence (EvoScientist separation of
+        # engineering policy from science) — never distill it.
+        return None
+
     before_txt = f"{before:.4f}" if isinstance(before, (int, float)) else "?"
     primary_txt = f"{primary:.4f}" if isinstance(primary, (int, float)) else "n/a"
     if param is not None:
@@ -2437,12 +2443,18 @@ def _finish_generation(ctx: LoopContext, state: dict,
             "winner": winner["run_id"] if winner is not None else None}
 
 
-def run_experiment(ctx: LoopContext, spec: ExperimentSpec,
-                   best_primary_snapshot: float | None) -> dict:
-    """Worker-thread body for one hypothesis. Touches ONLY its own worktree
-    and round dir; all state/ledger persistence happens on the main thread
-    after the generation barrier. Classification compares against the
-    generation-start incumbent snapshot so all K see the same target."""
+def _experiment_smoke_stage(ctx: LoopContext, spec: ExperimentSpec,
+                            best_primary_snapshot: float | None) -> dict:
+    """Worker-thread body, rung 0: implement -> policy checks -> commit ->
+    smoke evaluation (with bounded coder repair for MECHANICAL failures
+    only — the repair loop lives INSIDE this stage, so a later halving
+    elimination can never be mistaken for something to repair). Touches
+    ONLY its own worktree and round dir.
+
+    Returns the (partial) experiment record. verdict is None iff the run is
+    scoreable and may advance to the dev rung, in which case smoke_primary
+    carries the smoke-rung score (a short-budget DEV-split proxy — visible
+    to proposers by the same rule as every dev value)."""
     contract = ctx.contract
     pm = contract.primary_metric
     hyp = spec.hypothesis
@@ -2462,6 +2474,7 @@ def run_experiment(ctx: LoopContext, spec: ExperimentSpec,
         "failure_class": None,
         "decision": "reject",
         "primary": None,
+        "smoke_primary": None,
         "best_primary_before": best_primary_snapshot,
         "metrics_path": None,
         "proposer": hyp.proposer,
@@ -2602,7 +2615,29 @@ def run_experiment(ctx: LoopContext, spec: ExperimentSpec,
                           primary=primary, metrics_path=str(smoke_path))
         return record
 
-    # --- dev --------------------------------------------------------------------
+    smoke_value = (smoke.get("primary_metric") or {}).get("value")
+    if smoke_value is None:
+        # Executed and non-degenerate yet unscored: a valid negative,
+        # exactly as classify() rules — such a run cannot be ranked on the
+        # smoke rung and must not reach the dev rung as verdict-None.
+        verdict, failure_class, primary = classify(
+            smoke, best_primary_snapshot, pm)
+        record.update(verdict=verdict, failure_class=failure_class,
+                      primary=primary, metrics_path=str(smoke_path))
+        return record
+    record["smoke_primary"] = float(smoke_value)
+    return record
+
+
+def _experiment_dev_stage(ctx: LoopContext, spec: ExperimentSpec,
+                          best_primary_snapshot: float | None,
+                          record: dict) -> dict:
+    """Worker-thread body, rung 1: full dev evaluation + classification +
+    the post-evaluation tamper check. Only ever called on a record the
+    smoke stage left scoreable (verdict is None)."""
+    contract = ctx.contract
+    pm = contract.primary_metric
+
     dev_path = spec.round_dir / "metrics_dev.json"
     dev = run_evaluator(ctx.guard, spec.worktree, "dev", dev_path,
                         spec.run_id, contract.budgets.dev_train_timeout_s)
@@ -2616,6 +2651,75 @@ def run_experiment(ctx: LoopContext, spec: ExperimentSpec,
         record.update(verdict="contract_violation",
                       failure_class=f"post-eval protected/editable violation: {bad}")
     return record
+
+
+def run_experiment(ctx: LoopContext, spec: ExperimentSpec,
+                   best_primary_snapshot: float | None) -> dict:
+    """Worker-thread body for one hypothesis (no halving: both rungs run
+    back to back). All state/ledger persistence happens on the main thread
+    after the generation barrier. Classification compares against the
+    generation-start incumbent snapshot so all K see the same target."""
+    record = _experiment_smoke_stage(ctx, spec, best_primary_snapshot)
+    if record["verdict"] is not None:
+        return record
+    return _experiment_dev_stage(ctx, spec, best_primary_snapshot, record)
+
+
+def _apply_halving(records: list[dict], halving: Halving, *,
+                   direction: str) -> set[str]:
+    """Run ids advancing from the smoke rung to the dev rung (Phase 4b).
+
+    Deterministic rank-based cut over SCOREABLE smoke runs only: records
+    that are already terminal (mechanical failures, contract violations,
+    smoke-stage scientific negatives) never consume a survivor slot. The
+    survivor count is max(min_keep, ceil(K * keep_fraction)) with K the
+    actual generation size; ties break by run_id. Pure function."""
+    scoreable = [r for r in records
+                 if r.get("verdict") is None
+                 and isinstance(r.get("smoke_primary"), (int, float))]
+    keep = max(halving.min_keep,
+               math.ceil(len(records) * halving.keep_fraction))
+    sign = -1.0 if direction == "maximize" else 1.0
+    ranked = sorted(scoreable,
+                    key=lambda r: (sign * r["smoke_primary"], r["run_id"]))
+    return {r["run_id"] for r in ranked[:keep]}
+
+
+def _prune_record(record: dict) -> None:
+    """Mark a smoke-rung elimination (Phase 4b). Pruning is a BUDGET
+    decision on the noisy short-budget proxy, never scientific evidence:
+    distill_insight returns None for it and search momentum weighs it 0.
+    Its tested endpoints ARE still registered (the same aborted-only-skip
+    policy as every completed experiment, in both _finish_generation and
+    replay_ledger_fields) so the exact values are not re-proposed."""
+    record.update(verdict="pruned",
+                  failure_class="smoke_rank_below_cutoff",
+                  metrics_path=record.get("smoke_metrics_path"))
+
+
+def _aborted_record(spec: "ExperimentSpec", generation: int, base_commit: str,
+                    snapshot: float | None, exc: Exception) -> dict:
+    """One flaky evaluation must not burn the generation: per-branch
+    aborted record (excluded from tested/momentum/insights by verdict)."""
+    return {
+        "record_type": "experiment",
+        "run_id": spec.run_id,
+        "round": int(spec.run_id[1:]),
+        "generation": generation,
+        "timestamp_utc": utc_now(),
+        "hypothesis": spec.hypothesis.to_dict(),
+        "executor": spec.hypothesis.executor,
+        "branch": spec.branch,
+        "base_commit": base_commit,
+        "commit": None,
+        "verdict": "aborted",
+        "failure_class": f"evaluator_infra: {exc}",
+        "decision": "reject",
+        "primary": None,
+        "smoke_primary": None,
+        "best_primary_before": snapshot,
+        "proposer": spec.hypothesis.proposer,
+    }
 
 
 def _run_gate(ctx: LoopContext, state: dict, records: list[dict],
@@ -2883,39 +2987,57 @@ def run_generation(ctx: LoopContext, state: dict) -> dict | None:
 
     snapshot = state.get("best_primary")
     results: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=len(specs)) as pool:
-        futures = {pool.submit(run_experiment, ctx, spec, snapshot): spec
-                   for spec in specs}
-        try:
-            for future in as_completed(futures):
-                spec = futures[future]
-                try:
-                    results[spec.run_id] = future.result()
-                except ProtectionViolation:
-                    raise  # tamper is never a per-branch condition
-                except EvaluatorInfraError as exc:
-                    # One flaky evaluation must not burn the generation.
-                    results[spec.run_id] = {
-                        "record_type": "experiment",
-                        "run_id": spec.run_id,
-                        "round": int(spec.run_id[1:]),
-                        "generation": generation,
-                        "timestamp_utc": utc_now(),
-                        "hypothesis": spec.hypothesis.to_dict(),
-                        "executor": spec.hypothesis.executor,
-                        "branch": spec.branch,
-                        "base_commit": base_commit,
-                        "commit": None,
-                        "verdict": "aborted",
-                        "failure_class": f"evaluator_infra: {exc}",
-                        "decision": "reject",
-                        "primary": None,
-                        "best_primary_before": snapshot,
-                        "proposer": spec.hypothesis.proposer,
-                    }
-        except BaseException:
-            pool.shutdown(wait=False, cancel_futures=True)
-            raise
+
+    def _pool(fn, subset: list[ExperimentSpec]) -> None:
+        """Run one rung's workers. Workers touch only their own worktree;
+        results land in `results` on THIS thread (invariant 8)."""
+        with ThreadPoolExecutor(max_workers=len(subset)) as pool:
+            futures = {pool.submit(fn, spec): spec for spec in subset}
+            try:
+                for future in as_completed(futures):
+                    spec = futures[future]
+                    try:
+                        results[spec.run_id] = future.result()
+                    except ProtectionViolation:
+                        raise  # tamper is never a per-branch condition
+                    except EvaluatorInfraError as exc:
+                        results[spec.run_id] = _aborted_record(
+                            spec, generation, base_commit, snapshot, exc)
+            except BaseException:
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+
+    halving = pf.halving
+    if halving.enabled and len(specs) > 1:
+        # Phase 4b successive halving: rung 0 (smoke) for everyone, then a
+        # main-thread rank cut, then rung 1 (dev) for the survivors. The
+        # coder's mechanical-repair loop lives inside the smoke stage, so
+        # by the time the cut runs there is nothing left to repair
+        # (false-repair invariant 5 is structural).
+        _pool(lambda spec: _experiment_smoke_stage(ctx, spec, snapshot),
+              specs)
+        state["current_generation"]["phase"] = "smoked"
+        save_state(state)
+        survivors = _apply_halving([results[s.run_id] for s in specs],
+                                   halving,
+                                   direction=contract.primary_metric.direction)
+        dev_specs: list[ExperimentSpec] = []
+        for spec in specs:
+            record = results[spec.run_id]
+            if record.get("verdict") is not None:
+                continue  # already terminal at the smoke rung
+            if spec.run_id in survivors:
+                dev_specs.append(spec)
+            else:
+                _prune_record(record)
+        if dev_specs:
+            state["current_generation"]["phase"] = "executing_dev"
+            save_state(state)
+            dev_records = {s.run_id: results[s.run_id] for s in dev_specs}
+            _pool(lambda spec: _experiment_dev_stage(
+                ctx, spec, snapshot, dev_records[spec.run_id]), dev_specs)
+    else:
+        _pool(lambda spec: run_experiment(ctx, spec, snapshot), specs)
 
     ordered = [results[s.run_id] for s in specs]
     if getattr(ctx.proposer, "last_cost_usd", None) is not None:
@@ -3339,6 +3461,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             iv = (record.get("hypothesis") or {}).get("intervention") or {}
             primary = record.get("primary")
             primary_txt = f"{primary:.4f}" if isinstance(primary, float) else "n/a"
+            if (record.get("verdict") == "pruned"
+                    and isinstance(record.get("smoke_primary"), float)):
+                primary_txt = f"smoke {record['smoke_primary']:.4f}"
             if record.get("executor") == "coder":
                 what = "coder"
             else:
