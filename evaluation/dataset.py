@@ -5,11 +5,13 @@ PROTECTED FILE (listed in research_contract.yaml protected_globs).
 Split hygiene:
   * The training split uses a public seed (TRAIN_SEED) and is available to
     candidate code via load_train().
-  * The held-out split's seed lives in evaluation/heldout_config.json, which
-    is generated at `orchestrator.py init` time and deliberately NOT tracked
-    by git — worktrees materialize tracked files only, so candidate
-    workspaces physically lack the held-out seed. Only the root evaluator
-    calls load_heldout().
+  * Three hidden held-out splits (dev / gate / test) have independent seeds
+    in evaluation/heldout_config.json, which is generated at
+    `orchestrator.py init` time and deliberately NOT tracked by git —
+    worktrees materialize tracked files only, so candidate workspaces
+    physically lack the seeds. Only the root evaluator calls load_split().
+    dev drives keep/reject search, gate is the blind admission split, test
+    stays untouched until the campaign-end report.
 
 Determinism:
   * Gaussian samples come from a hand-rolled Box–Muller transform over
@@ -41,7 +43,10 @@ NOISE_STD = 0.25
 
 TRAIN_SEED = 20260401  # public
 N_TRAIN = 600
-DEFAULT_N_HELDOUT = 400
+# Split sizes are PUBLIC constants hardcoded here (the seeds are the secret):
+# a size read from the untracked config could be manipulated (e.g. a 1-row
+# gate split), so the evaluator trusts only this file for sizes.
+SPLIT_SIZES = {"dev": 400, "gate": 400, "test": 600}
 
 
 def _gauss(rng: random.Random) -> float:
@@ -70,10 +75,24 @@ def load_train() -> tuple[list[list[float]], list[float]]:
     return generate(TRAIN_SEED, N_TRAIN)
 
 
-def load_heldout(config_path: str | Path) -> tuple[list[list[float]], list[float]]:
-    """Held-out split. Called only by the root evaluator."""
+HELDOUT_SPLITS = ("dev", "gate", "test")
+
+
+def load_split(
+    config_path: str | Path, split: str
+) -> tuple[list[list[float]], list[float]]:
+    """One hidden held-out split (dev/gate/test). Root evaluator only.
+
+    Config schema v2: {"schema_version": 2, "splits": {name: {seed, size}}}.
+    """
+    if split not in SPLIT_SIZES:
+        raise KeyError(f"unknown split {split!r} (have: {sorted(SPLIT_SIZES)})")
     cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
-    return generate(int(cfg["seed"]), int(cfg.get("size", DEFAULT_N_HELDOUT)))
+    splits = cfg.get("splits")
+    if not isinstance(splits, dict) or split not in splits:
+        have = sorted(splits) if isinstance(splits, dict) else "none"
+        raise KeyError(f"split {split!r} missing from heldout config (have: {have})")
+    return generate(int(splits[split]["seed"]), SPLIT_SIZES[split])
 
 
 def fingerprint(values: list[float], k: int = 32) -> str:

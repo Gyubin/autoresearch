@@ -10,14 +10,14 @@
 # To intentionally change the contract: stop all runs, `chmod u+w` the file,
 # edit, then re-run `orchestrator.py init --force` to rebuild the manifest.
 # =============================================================================
-schema_version: 1
-contract_id: autoresearch-phase1-sgd-tuning
+schema_version: 2
+contract_id: autoresearch-phase2-portfolio
 
 objective: >
-  Minimize held-out RMSE of the synthetic-regression model trained by
-  src/train.py, by changing training hyperparameters only. The evaluator,
-  dataset definition, this contract, and the orchestrator are immutable
-  during runs.
+  Minimize held-out RMSE of the model trained by src/train.py. Interventions
+  may change training hyperparameters (deterministic patcher) or edit code
+  under src/** (LLM coding worker). The evaluator, dataset definition, this
+  contract, and the orchestrator are immutable during runs.
 
 primary_metric:
   name: heldout_rmse
@@ -50,8 +50,27 @@ budgets:
   # `orchestrator.py init` cross-checks the two once, failing fast on drift.
   smoke_train_timeout_s: 20
   dev_train_timeout_s: 90
-  max_rounds: 40
+  # max_rounds is the EXPERIMENT budget (rNNNN allocator), not generations:
+  # a generation of parallel_branches consumes that many rounds.
+  max_rounds: 60
   repair_attempts: 2
 
+portfolio:
+  # Hypotheses executed in parallel per generation (isolated worktrees).
+  parallel_branches: 4
+  # Dev-improving candidates forwarded to the blind admission gate.
+  gate_top_k: 2
+  # Gate epsilon: the winner must beat the incumbent's gate score by this
+  # relative margin. Gate scores are never exposed to proposers/insights.
+  gate_min_relative_improvement: 0.001
+  # At most this many LLM-coder hypotheses per generation.
+  max_coder_hypotheses: 1
+  # Optional hard cap on generations (null = bounded by max_rounds only).
+  max_generations: null
+  # LLM coding worker budgets (per hypothesis).
+  coder_max_turns: 25
+  coder_max_budget_usd: 1.5
+
 stop_conditions:
-  stagnation_rounds: 6
+  # Consecutive generations without an admitted winner.
+  stagnation_generations: 4

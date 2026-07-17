@@ -12,8 +12,10 @@ Trust model / invariants:
     echo of the contract):
       - budgets are hardcoded here; `orchestrator.py init` cross-checks them
         against research_contract.yaml once and fails fast on drift;
-      - the held-out seed comes from evaluation/heldout_config.json next to
-        THIS file, never from the workspace;
+      - held-out seeds (three splits: dev for search, gate for blind
+        admission, test untouched until the campaign-end report) come from
+        evaluation/heldout_config.json next to THIS file, never from the
+        workspace;
       - dataset code is loaded from THIS directory by absolute file path, so
         workspace code can never enter the evaluator's import path.
   * The train subprocess gets a from-scratch environment (PATH,
@@ -47,8 +49,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-EVALUATOR_VERSION = "1.0.0"
-METRICS_SCHEMA_VERSION = "1.0"
+EVALUATOR_VERSION = "1.1.0"
+METRICS_SCHEMA_VERSION = "1.1"
 
 # Hardcoded budgets and metric identity — see trust model above. The
 # orchestrator cross-checks ALL of these against the contract at init and on
@@ -56,9 +58,17 @@ METRICS_SCHEMA_VERSION = "1.0"
 TRAIN_TIMEOUT_S = {"smoke": 20, "dev": 90}
 PRIMARY_METRIC_NAME = "heldout_rmse"
 PRIMARY_METRIC_DIRECTION = "minimize"
+SPLIT_NAMES = ("dev", "gate", "test")
 
 MAX_ARTIFACT_BYTES = 1_000_000
 TAIL_BYTES = 2048
+
+# Declarative engineered-feature bounds: candidates may declare model inputs
+# as products of raw features (e.g. [0, 1] -> x0*x1) in artifacts/model.json.
+# This widens the model class WITHOUT ever executing candidate code inside
+# the evaluator — the spec is data, validated like the weights.
+MAX_FEATURE_TERMS = 32
+MAX_TERM_DEGREE = 3
 
 EVAL_DIR = Path(__file__).resolve().parent
 ROOT_DIR = EVAL_DIR.parent
@@ -185,6 +195,37 @@ def _load_artifact(workspace: Path, notes: list[str]) -> tuple[dict | None, str 
     return artifact, None
 
 
+def _validate_feature_spec(
+    spec: object, n_features: int, notes: list[str]
+) -> list[list[int]] | None:
+    """Validate the declarative engineered-feature spec (pure data).
+
+    Each term is a list of raw-feature indices whose product forms one model
+    input; None (absent) means the identity spec — one term per raw feature —
+    which keeps Phase 1 artifacts scoring identically.
+    """
+    if spec is None:
+        return [[j] for j in range(n_features)]
+    if not isinstance(spec, list) or not 1 <= len(spec) <= MAX_FEATURE_TERMS:
+        notes.append(f"feature_spec must be a list of 1..{MAX_FEATURE_TERMS} terms")
+        return None
+    validated: list[list[int]] = []
+    for term in spec:
+        if (
+            not isinstance(term, list)
+            or not 1 <= len(term) <= MAX_TERM_DEGREE
+            or not all(
+                isinstance(i, int) and not isinstance(i, bool)
+                and 0 <= i < n_features
+                for i in term
+            )
+        ):
+            notes.append(f"invalid feature term: {term!r}")
+            return None
+        validated.append([int(i) for i in term])
+    return validated
+
+
 def _validate_model(
     artifact: dict, n_features: int, notes: list[str]
 ) -> tuple[dict | None, str | None]:
@@ -194,16 +235,20 @@ def _validate_model(
     outcome (divergence is scientific evidence), structural problems are
     malformed_artifact.
     """
+    spec = _validate_feature_spec(artifact.get("feature_spec"), n_features, notes)
+    if spec is None:
+        return None, "malformed_artifact"
+
     weights = artifact.get("weights")
     bias = artifact.get("bias")
     if (
         not isinstance(weights, list)
-        or len(weights) != n_features
+        or len(weights) != len(spec)
         or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in weights)
         or not isinstance(bias, (int, float))
         or isinstance(bias, bool)
     ):
-        notes.append("weights/bias missing or wrong shape")
+        notes.append("weights/bias missing or wrong shape for the feature spec")
         return None, "malformed_artifact"
 
     hp = artifact.get("hyperparams")
@@ -218,8 +263,8 @@ def _validate_model(
         ok = (
             isinstance(means, list)
             and isinstance(stds, list)
-            and len(means) == n_features
-            and len(stds) == n_features
+            and len(means) == len(spec)
+            and len(stds) == len(spec)
             and all(_is_finite_number(v) for v in means)
             and all(_is_finite_number(v) and v != 0.0 for v in stds)
         )
@@ -234,10 +279,21 @@ def _validate_model(
     return {
         "weights": [float(v) for v in weights],
         "bias": float(bias),
+        "spec": spec,
         "scaling": scaling,
         "means": means,
         "stds": stds,
     }, None
+
+
+def _engineer(x: list[float], spec: list[list[int]]) -> list[float]:
+    out = []
+    for term in spec:
+        v = 1.0
+        for i in term:
+            v *= x[i]
+        out.append(v)
+    return out
 
 
 def _predict_rmse(
@@ -246,12 +302,15 @@ def _predict_rmse(
     """RMSE of the model on (xs, ys); None if predictions go non-finite."""
     w = model["weights"]
     b = model["bias"]
+    spec = model["spec"]
+    k = len(spec)
+    phi = [_engineer(x, spec) for x in xs]
     if model["scaling"]:
         m, s = model["means"], model["stds"]
-        xs = [[(row[j] - m[j]) / s[j] for j in range(n_features)] for row in xs]
+        phi = [[(row[j] - m[j]) / s[j] for j in range(k)] for row in phi]
     sse = 0.0
-    for x, y in zip(xs, ys):
-        pred = b + sum(w[j] * x[j] for j in range(n_features))
+    for row, y in zip(phi, ys):
+        pred = b + sum(w[j] * row[j] for j in range(k))
         if not math.isfinite(pred):
             return None
         d = pred - y
@@ -261,7 +320,8 @@ def _predict_rmse(
     return math.sqrt(sse / len(ys))
 
 
-def evaluate(workspace: Path, mode: str, run_id: str, nonce: str, out_path: Path) -> dict:
+def evaluate(workspace: Path, mode: str, split: str, run_id: str, nonce: str,
+             out_path: Path) -> dict:
     started = time.perf_counter()
     out_path.parent.mkdir(parents=True, exist_ok=True)  # log files land here too
     notes: list[str] = []
@@ -269,6 +329,7 @@ def evaluate(workspace: Path, mode: str, run_id: str, nonce: str, out_path: Path
     metrics: dict = {
         "schema_version": METRICS_SCHEMA_VERSION,
         "mode": mode,
+        "split": split,
         "run_id": run_id,
         "nonce": nonce,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -350,10 +411,11 @@ def evaluate(workspace: Path, mode: str, run_id: str, nonce: str, out_path: Path
         metrics["degenerate"] = failure == "degenerate_weights"
         return done()
 
-    xs_h, ys_h = ds.load_heldout(HELDOUT_CONFIG)
+    xs_h, ys_h = ds.load_split(HELDOUT_CONFIG, split)
     metrics["dataset"] = {
         "train_seed": ds.TRAIN_SEED,
         "n_train": ds.N_TRAIN,
+        "split": split,
         "n_heldout": len(ys_h),
         "heldout_fingerprint": ds.fingerprint(ys_h),
     }
@@ -384,6 +446,7 @@ def evaluate(workspace: Path, mode: str, run_id: str, nonce: str, out_path: Path
             else None
         ),
         "constant_baseline_rmse": constant_baseline_rmse,
+        "feature_terms": len(model["spec"]),
     }
 
     if heldout_rmse > constant_baseline_rmse:
@@ -414,19 +477,26 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", required=True, type=Path)
     parser.add_argument("--mode", choices=("smoke", "dev"), default="dev")
+    parser.add_argument("--split", choices=SPLIT_NAMES, default="dev")
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--run-id", default="")
     parser.add_argument("--nonce", default="")
     args = parser.parse_args()
 
+    if args.mode == "smoke" and args.split != "dev":
+        # gate/test are full-budget admission/report evaluations only.
+        parser.error("--mode smoke is only valid with --split dev")
+
     try:
         metrics = evaluate(
-            args.workspace.resolve(), args.mode, args.run_id, args.nonce, args.out
+            args.workspace.resolve(), args.mode, args.split, args.run_id,
+            args.nonce, args.out
         )
     except Exception as exc:  # infra failure: report loudly, exit nonzero
         crash = {
             "schema_version": METRICS_SCHEMA_VERSION,
             "mode": args.mode,
+            "split": args.split,
             "run_id": args.run_id,
             "nonce": args.nonce,
             "executed": False,

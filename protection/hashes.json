@@ -1,14 +1,14 @@
 {
   "algorithm": "sha256",
-  "created_utc": "2026-07-17T01:22:05.417655+00:00",
+  "created_utc": "2026-07-17T02:50:45.032638+00:00",
   "files": {
     ".python-version": "a876e0b10411037a012498b9fe18d9bc1df32ed8b722a13564dc944ddcfd9135",
-    "evaluation/dataset.py": "1b460cad37d213b85baa0b7f804b6078602f6684f27a7317ddd6cccfc1702b31",
-    "evaluation/evaluate.py": "b045253819edf0d56aec3abbc3ae6e5d3e8ddce8000d46aab5b2b5fd0ce715a4",
-    "evaluation/heldout_config.json": "8b6bba8bd6809fd92d744b343309d0e3daeb7a6dbf57aed2d83559388606d647",
-    "orchestrator.py": "5d4f052e643fcb3d24305c392d97d6b9aa10e347d9598753d8e8257d062d3999",
+    "evaluation/dataset.py": "5ee4648b70995615bcb48d2b67ef047879044b2121aa812e2dade0d0b3a9bc0e",
+    "evaluation/evaluate.py": "dd4fabbc346a9cde924eb166224e3b7874c711946d819491803ff90870ec87f2",
+    "evaluation/heldout_config.json": "586921fdd6c84e465056c8feddf48d381e3c643ff424b03e188950ad116c8e17",
+    "orchestrator.py": "c297a3a453a14611ed377cfa6a44def2ed1afc3c9f14d43e1a75151a2e5fc6a9",
     "pyproject.toml": "22b03084ceb9648ae46bdebc5f1833da3dc16e06b22e28fef952e82ebbd8dec1",
-    "research_contract.yaml": "91265dc55613d41b6a962f14d099ae309c4ca1525c75388273cbec00d157891d",
+    "research_contract.yaml": "11bb64e92bf134e01e7708a5497560590261f8b4a0bc9df575a7a8911b72af6a",
     "uv.lock": "8e9fae89b8b6b8221ea66d380d83e64765f9e87aa386deb46ec341eb277a94f1"
   },
   "protected_globs": [

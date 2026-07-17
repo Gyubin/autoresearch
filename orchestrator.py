@@ -52,6 +52,8 @@ import secrets
 import shutil
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -81,7 +83,7 @@ WORKTREES_DIR = ROOT / ".worktrees"
 # delete a lock file another process holds.
 LOCK_PATH = ROOT / ".orchestrator.lock"
 
-STATE_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2
 
 # Top-level directories never scanned for protected files (runtime/venv/tooling).
 SCAN_EXCLUDE = {".git", ".venv", ".worktrees", "experiments", "artifacts",
@@ -245,7 +247,18 @@ class Budgets:
 
 @dataclass(frozen=True)
 class StopConditions:
-    stagnation_rounds: int
+    stagnation_generations: int
+
+
+@dataclass(frozen=True)
+class Portfolio:
+    parallel_branches: int
+    gate_top_k: int
+    gate_min_relative_improvement: float
+    max_coder_hypotheses: int
+    max_generations: int | None
+    coder_max_turns: int
+    coder_max_budget_usd: float
 
 
 @dataclass(frozen=True)
@@ -258,6 +271,7 @@ class ResearchContract:
     editable_globs: tuple[str, ...]
     protected_globs: tuple[str, ...]
     budgets: Budgets
+    portfolio: Portfolio
     stop_conditions: StopConditions
 
 
@@ -290,8 +304,9 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         raise ContractError("contract root must be a mapping")
 
     schema_version = _require(raw, "schema_version", int, "")
-    if schema_version != 1:
-        raise ContractError(f"unsupported contract schema_version {schema_version}")
+    if schema_version != 2:
+        raise ContractError(f"unsupported contract schema_version {schema_version} "
+                            f"(this orchestrator expects 2)")
 
     pm_raw = _require(raw, "primary_metric", dict, "")
     direction = _require(pm_raw, "direction", str, "primary_metric")
@@ -315,10 +330,44 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
 
     stop_raw = _require(raw, "stop_conditions", dict, "")
     stop = StopConditions(
-        stagnation_rounds=_require(stop_raw, "stagnation_rounds", int, "stop_conditions")
+        stagnation_generations=_require(stop_raw, "stagnation_generations", int,
+                                        "stop_conditions")
     )
-    if stop.stagnation_rounds <= 0:
-        raise ContractError("stop_conditions.stagnation_rounds must be positive")
+    if stop.stagnation_generations <= 0:
+        raise ContractError("stop_conditions.stagnation_generations must be positive")
+
+    pf_raw = _require(raw, "portfolio", dict, "")
+    max_generations = pf_raw.get("max_generations")
+    if max_generations is not None and (
+        not isinstance(max_generations, int) or isinstance(max_generations, bool)
+        or max_generations <= 0
+    ):
+        raise ContractError("portfolio.max_generations must be a positive int or null")
+    portfolio = Portfolio(
+        parallel_branches=_require(pf_raw, "parallel_branches", int, "portfolio"),
+        gate_top_k=_require(pf_raw, "gate_top_k", int, "portfolio"),
+        gate_min_relative_improvement=float(
+            _require(pf_raw, "gate_min_relative_improvement", (int, float), "portfolio")
+        ),
+        max_coder_hypotheses=_require(pf_raw, "max_coder_hypotheses", int, "portfolio"),
+        max_generations=max_generations,
+        coder_max_turns=_require(pf_raw, "coder_max_turns", int, "portfolio"),
+        coder_max_budget_usd=float(
+            _require(pf_raw, "coder_max_budget_usd", (int, float), "portfolio")
+        ),
+    )
+    if not 1 <= portfolio.gate_top_k <= portfolio.parallel_branches <= 8:
+        raise ContractError(
+            "portfolio must satisfy 1 <= gate_top_k <= parallel_branches <= 8"
+        )
+    if not 0 <= portfolio.max_coder_hypotheses <= portfolio.parallel_branches:
+        raise ContractError(
+            "portfolio.max_coder_hypotheses must be within [0, parallel_branches]"
+        )
+    if not 0.0 <= portfolio.gate_min_relative_improvement < 1.0:
+        raise ContractError(
+            "portfolio.gate_min_relative_improvement must be in [0, 1)"
+        )
 
     return ResearchContract(
         schema_version=schema_version,
@@ -333,6 +382,7 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         editable_globs=_str_tuple(raw, "editable_globs", ""),
         protected_globs=_str_tuple(raw, "protected_globs", ""),
         budgets=budgets,
+        portfolio=portfolio,
         stop_conditions=stop,
     )
 
@@ -431,6 +481,19 @@ class ProtectionGuard:
 # ---------------------------------------------------------------------------
 
 class Git:
+    """Git wrapper with a concurrency policy for the parallel portfolio.
+
+    Worker threads may only run per-worktree operations scoped to THEIR OWN
+    worktree (add/commit/diff/status/checkout/rev-parse): linked worktrees
+    have private index and HEAD files, and commits take per-ref locks on
+    distinct hyp/* refs. Operations that mutate SHARED repo state — the
+    .git/worktrees admin dir (worktree add/remove/prune), packed-refs
+    (branch -D), and main's HEAD (merge) — are serialized behind
+    _mutation_lock and, by construction, called from the main thread only.
+    """
+
+    _mutation_lock = threading.Lock()
+
     def __init__(self, root: Path) -> None:
         self.root = root
 
@@ -469,23 +532,32 @@ class Git:
                         check=False).returncode == 0
 
     def delete_branch(self, name: str) -> None:
-        self.run("branch", "-D", name)
+        with self._mutation_lock:
+            self.run("branch", "-D", name)
 
     def branch_tip(self, name: str) -> str:
         return self.run("rev-parse", f"refs/heads/{name}").stdout.strip()
 
     def worktree_add(self, path: Path, branch: str, base: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.run("worktree", "add", "-b", branch, str(path), base)
+        with self._mutation_lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.run("worktree", "add", "-b", branch, str(path), base)
+
+    def worktree_add_detached(self, path: Path, commit: str) -> None:
+        with self._mutation_lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.run("worktree", "add", "--detach", str(path), commit)
 
     def worktree_remove(self, path: Path) -> None:
-        proc = self.run("worktree", "remove", "--force", str(path), check=False)
-        if proc.returncode != 0 and path.exists():
-            shutil.rmtree(path, ignore_errors=True)
-        self.run("worktree", "prune", check=False)
+        with self._mutation_lock:
+            proc = self.run("worktree", "remove", "--force", str(path), check=False)
+            if proc.returncode != 0 and path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+            self.run("worktree", "prune", check=False)
 
     def worktree_prune(self) -> None:
-        self.run("worktree", "prune", check=False)
+        with self._mutation_lock:
+            self.run("worktree", "prune", check=False)
 
     def status_paths(self, cwd: Path | None = None,
                      include_untracked: bool = True) -> list[str]:
@@ -515,7 +587,8 @@ class Git:
         return [line.strip() for line in out.splitlines() if line.strip()]
 
     def merge_ff(self, ref: str) -> None:
-        self.run("merge", "--ff-only", ref)
+        with self._mutation_lock:
+            self.run("merge", "--ff-only", ref)
 
     def is_ancestor(self, ancestor: str, descendant: str) -> bool:
         return self.run("merge-base", "--is-ancestor", ancestor, descendant,
@@ -537,10 +610,17 @@ class Hypothesis:
     falsifier: str
     minimal_test: str
     proposer: str
+    executor: str = "patcher"  # "patcher" | "coder"
+    implementation_brief: str = ""  # coder-only: what to build under src/**
     prior_evidence: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
+
+
+def _slug(hypothesis: Hypothesis) -> str:
+    base = hypothesis.intervention.get("param") or hypothesis.executor
+    return re.sub(r"[^a-z0-9_-]", "-", str(base).lower())[:30] or "hyp"
 
 
 BEGIN_MARK = "# --- HYPERPARAMS-BEGIN"
@@ -711,7 +791,7 @@ class HeuristicProposer:
         moves.append(("batch_up", "batch_size", min(int(hp["batch_size"]) * 2, 256)))
         return moves
 
-    def propose(self, ctx: ProposalContext) -> Optional[Hypothesis]:
+    def _filtered_candidates(self, ctx: ProposalContext) -> list[tuple[str, str, Any]]:
         hp = ctx.current_hyperparams
         candidates = []
         for kind, param, new_value in self._moves(hp):
@@ -724,8 +804,6 @@ class HeuristicProposer:
             if value_repr(new_value) in ctx.tested.get(param, []):
                 continue
             candidates.append((kind, param, new_value))
-        if not candidates:
-            return None
 
         last = ctx.last_accepted
         if last:
@@ -734,14 +812,17 @@ class HeuristicProposer:
                     candidates.remove(cand)
                     candidates.insert(0, cand)
                     break
+        return candidates
 
-        kind, param, new_value = candidates[0]
+    def _certificate(self, ctx: ProposalContext, round_index: int,
+                     kind: str, param: str, new_value: Any) -> Hypothesis:
+        hp = ctx.current_hyperparams
         pm = ctx.contract.primary_metric
         best = ctx.best_primary
         best_txt = f"{best:.4f}" if best is not None else "the baseline"
         return Hypothesis(
-            id=f"h_r{ctx.round_index:04d}_{param}",
-            round=ctx.round_index,
+            id=f"h_r{round_index:04d}_{param}",
+            round=round_index,
             statement=(
                 f"Changing {param} from {hp[param]!r} to {new_value!r} will "
                 f"{pm.direction} {pm.name} by at least "
@@ -764,9 +845,24 @@ class HeuristicProposer:
             ),
             minimal_test="one smoke + one dev evaluation on the patched worktree",
             proposer=self.name,
+            executor="patcher",
             prior_evidence=[i["insight_id"] for i in ctx.insights[-3:]
                             if "insight_id" in i],
         )
+
+    def propose_batch(self, ctx: ProposalContext, k: int) -> list[Hypothesis]:
+        """Top-k diverse moves: at most one hypothesis per parameter."""
+        batch: list[Hypothesis] = []
+        seen_params: set[str] = set()
+        for kind, param, new_value in self._filtered_candidates(ctx):
+            if param in seen_params:
+                continue
+            batch.append(self._certificate(ctx, ctx.round_index + len(batch),
+                                           kind, param, new_value))
+            seen_params.add(param)
+            if len(batch) == k:
+                break
+        return batch
 
 
 class ClaudeProposer:
@@ -784,25 +880,42 @@ class ClaudeProposer:
         self.max_budget_usd = max_budget_usd
         self.last_cost_usd: float | None = None
 
-    def _schema(self, hp: dict) -> dict:
-        return {
+    def _schema(self, hp: dict, k: int, allow_coder: bool) -> dict:
+        executors = ["patcher", "coder"] if allow_coder else ["patcher"]
+        item = {
             "type": "object",
             "properties": {
                 "statement": {"type": "string"},
                 "mechanism": {"type": "string"},
-                "param": {"type": "string", "enum": sorted(hp.keys())},
-                # anyOf (not a union type list): the SDK's strict-mode schema
+                "executor": {"type": "string", "enum": executors},
+                # anyOf (not union type lists): the SDK's strict-mode schema
                 # validator rejects `"type": [...]` unions.
-                "new_value": {"anyOf": [{"type": "number"}, {"type": "boolean"}]},
+                "param": {"anyOf": [{"type": "string", "enum": sorted(hp.keys())},
+                                    {"type": "null"}]},
+                "new_value": {"anyOf": [{"type": "number"}, {"type": "boolean"},
+                                        {"type": "null"}]},
+                "implementation_brief": {"anyOf": [{"type": "string"},
+                                                   {"type": "null"}]},
                 "predicted_effect": {"type": "string"},
                 "falsifier": {"type": "string"},
             },
-            "required": ["statement", "mechanism", "param", "new_value",
+            "required": ["statement", "mechanism", "executor", "param",
+                         "new_value", "implementation_brief",
                          "predicted_effect", "falsifier"],
             "additionalProperties": False,
         }
+        return {
+            "type": "object",
+            "properties": {
+                "hypotheses": {"type": "array", "minItems": 1, "maxItems": k,
+                               "items": item},
+            },
+            "required": ["hypotheses"],
+            "additionalProperties": False,
+        }
 
-    def _prompt(self, ctx: ProposalContext, feedback: str | None) -> str:
+    def _prompt(self, ctx: ProposalContext, k: int, max_coder: int,
+                feedback: str | None) -> str:
         pm = ctx.contract.primary_metric
         insights = ctx.insights[-10:]
         tested_lines = [
@@ -811,32 +924,46 @@ class ClaudeProposer:
         ] or ["  (none yet)"]
         parts = [
             "You are the hypothesis proposer inside a constrained autoresearch "
-            "loop (Karpathy-style keep/reject).",
+            "loop (portfolio of parallel keep/reject experiments).",
             f"Objective: {ctx.contract.objective}",
-            f"Primary metric: {pm.name} ({pm.direction}); a candidate is kept "
-            f"only if it improves the incumbent by >= "
-            f"{pm.min_relative_improvement:.1%} relative. Evaluation is "
-            f"deterministic (fixed seeds).",
-            f"Current incumbent {pm.name}: {ctx.best_primary!r}",
-            f"Current hyperparameters of src/train.py (minibatch SGD, linear "
-            f"model, 8 features with heterogeneous scales): "
-            f"{json.dumps(ctx.current_hyperparams)}",
+            f"Primary metric: {pm.name} ({pm.direction}); a candidate must "
+            f"improve the incumbent by >= {pm.min_relative_improvement:.1%} "
+            f"relative on the dev split, then survive a blind admission gate. "
+            f"Evaluation is deterministic (fixed seeds).",
+            f"Current incumbent {pm.name} (dev): {ctx.best_primary!r}",
+            f"Current hyperparameters of src/train.py (minibatch SGD over a "
+            f"declarative feature spec; 8 raw features with heterogeneous "
+            f"scales): {json.dumps(ctx.current_hyperparams)}",
             "Already-tested interventions — do NOT repeat any of these "
             "(param: values):",
             *tested_lines,
             "Distilled insights from past rounds:",
             json.dumps(insights, indent=2) if insights else "  (none yet)",
-            "Propose exactly ONE atomic intervention: change ONE "
-            "hyperparameter to ONE new value. Ground the mechanism in "
-            "optimization reasoning, state a concrete falsifier, and prefer "
-            "the highest-expected-improvement untested move.",
+            f"Propose UP TO {k} scientifically DIVERSE hypotheses for one "
+            f"portfolio generation. Rules:\n"
+            f"- executor='patcher': change exactly ONE hyperparameter to ONE "
+            f"new value (set param + new_value; implementation_brief null).\n"
+            f"- executor='coder' (at most {max_coder} per generation): a code "
+            f"change under src/** implemented by a coding agent (set param "
+            f"and new_value to null; write a concrete implementation_brief). "
+            f"The trainer may declare engineered features in "
+            f"artifacts/model.json as 'feature_spec': a list of terms, each "
+            f"a list of raw-feature indices multiplied together (e.g. "
+            f"[[0],[1],...,[7],[0,1]] adds an x0*x1 interaction input). The "
+            f"evaluator scores bias + weights . engineered_features. If the "
+            f"target relationship has structure a linear readout of raw "
+            f"features cannot capture, a coder hypothesis extending the "
+            f"feature spec is the only way to reach it.\n"
+            f"- No two hypotheses on the same param; prefer mechanisms that "
+            f"attack DIFFERENT bottlenecks (optimization, model class, "
+            f"regularization).",
         ]
         if feedback:
-            parts.append(f"Your previous proposal was rejected: {feedback}. "
-                         f"Propose a different, valid intervention.")
+            parts.append(f"Your previous batch had problems: {feedback}. "
+                         f"Propose a corrected batch.")
         return "\n\n".join(parts)
 
-    def _query(self, prompt: str, hp: dict) -> dict:
+    def _query(self, prompt: str, schema: dict) -> dict:
         import asyncio
 
         from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
@@ -850,7 +977,7 @@ class ClaudeProposer:
                 "You are a careful ML research strategist. Respond only with "
                 "the requested structured output."
             ),
-            output_format={"type": "json_schema", "schema": self._schema(hp)},
+            output_format={"type": "json_schema", "schema": schema},
             max_budget_usd=self.max_budget_usd,
         )
 
@@ -871,12 +998,41 @@ class ClaudeProposer:
 
         return asyncio.run(_run())
 
-    def _validate(self, raw: dict, ctx: ProposalContext) -> tuple[str, Any] | str:
-        """Returns (param, coerced_value) or an error string."""
+    def _validate_item(self, raw: dict, ctx: ProposalContext,
+                       seen_params: set[str], coder_count: int,
+                       max_coder: int) -> Hypothesis | str:
+        """Returns a Hypothesis or an error string."""
         hp = ctx.current_hyperparams
+        executor = raw.get("executor")
+
+        if executor == "coder":
+            if coder_count >= max_coder:
+                return f"more than {max_coder} coder hypotheses"
+            brief = raw.get("implementation_brief")
+            if not isinstance(brief, str) or len(brief.strip()) < 30:
+                return "coder hypothesis needs a concrete implementation_brief"
+            return Hypothesis(
+                id=f"h_r{ctx.round_index:04d}_coder",
+                round=ctx.round_index,
+                statement=str(raw["statement"]),
+                mechanism=str(raw["mechanism"]),
+                intervention={"param": None, "from": None, "to": None,
+                              "kind": "coder"},
+                predicted_effect=str(raw["predicted_effect"]),
+                falsifier=str(raw["falsifier"]),
+                minimal_test="one smoke + one dev evaluation on the coder's worktree",
+                proposer=self.name,
+                executor="coder",
+                implementation_brief=brief.strip(),
+                prior_evidence=[i["insight_id"] for i in ctx.insights[-3:]
+                                if "insight_id" in i],
+            )
+
         param = raw.get("param")
         if not isinstance(param, str) or param not in hp:
             return f"unknown param {param!r}"
+        if param in seen_params:
+            return f"duplicate param {param!r} in one generation"
         new_value: Any = raw.get("new_value")
         current = hp[param]
         if isinstance(current, bool):
@@ -896,32 +1052,53 @@ class ClaudeProposer:
             return f"{param} unchanged ({current!r})"
         if value_repr(new_value) in ctx.tested.get(param, []):
             return f"({param}, {new_value!r}) was already tested"
-        return (param, new_value)
+        return Hypothesis(
+            id=f"h_r{ctx.round_index:04d}_{param}",
+            round=ctx.round_index,
+            statement=str(raw["statement"]),
+            mechanism=str(raw["mechanism"]),
+            intervention={"param": param, "from": current, "to": new_value,
+                          "kind": f"claude:{param}"},
+            predicted_effect=str(raw["predicted_effect"]),
+            falsifier=str(raw["falsifier"]),
+            minimal_test="one smoke + one dev evaluation on the patched worktree",
+            proposer=self.name,
+            executor="patcher",
+            prior_evidence=[i["insight_id"] for i in ctx.insights[-3:]
+                            if "insight_id" in i],
+        )
 
-    def propose(self, ctx: ProposalContext) -> Optional[Hypothesis]:
+    def propose_batch(self, ctx: ProposalContext, k: int) -> list[Hypothesis]:
+        max_coder = ctx.contract.portfolio.max_coder_hypotheses
+        schema = self._schema(ctx.current_hyperparams, k, max_coder > 0)
         feedback: str | None = None
-        for _ in range(2):  # one retry with validation feedback
-            raw = self._query(self._prompt(ctx, feedback), ctx.current_hyperparams)
-            validated = self._validate(raw, ctx)
-            if isinstance(validated, str):
-                feedback = validated
+        for _ in range(2):  # one whole-batch retry with per-item feedback
+            raw = self._query(self._prompt(ctx, k, max_coder, feedback), schema)
+            items = raw.get("hypotheses")
+            if not isinstance(items, list):
+                feedback = "missing hypotheses array"
                 continue
-            param, new_value = validated
-            return Hypothesis(
-                id=f"h_r{ctx.round_index:04d}_{param}",
-                round=ctx.round_index,
-                statement=str(raw["statement"]),
-                mechanism=str(raw["mechanism"]),
-                intervention={"param": param, "from": ctx.current_hyperparams[param],
-                              "to": new_value, "kind": f"claude:{param}"},
-                predicted_effect=str(raw["predicted_effect"]),
-                falsifier=str(raw["falsifier"]),
-                minimal_test="one smoke + one dev evaluation on the patched worktree",
-                proposer=self.name,
-                prior_evidence=[i["insight_id"] for i in ctx.insights[-3:]
-                                if "insight_id" in i],
-            )
-        raise ProposerError(f"Claude proposer failed validation twice: {feedback}")
+            batch: list[Hypothesis] = []
+            seen_params: set[str] = set()
+            coder_count = 0
+            errors: list[str] = []
+            for item in items[:k]:
+                validated = self._validate_item(
+                    item if isinstance(item, dict) else {},
+                    ctx, seen_params, coder_count, max_coder,
+                )
+                if isinstance(validated, str):
+                    errors.append(validated)
+                    continue
+                if validated.executor == "coder":
+                    coder_count += 1
+                else:
+                    seen_params.add(validated.intervention["param"])
+                batch.append(validated)
+            if batch:
+                return batch
+            feedback = "; ".join(errors) or "no valid items"
+        raise ProposerError(f"Claude proposer produced no valid batch: {feedback}")
 
 
 class FallbackProposer:
@@ -936,13 +1113,236 @@ class FallbackProposer:
     def last_cost_usd(self) -> float | None:
         return getattr(self.primary, "last_cost_usd", None)
 
-    def propose(self, ctx: ProposalContext) -> Optional[Hypothesis]:
+    def propose_batch(self, ctx: ProposalContext, k: int) -> list[Hypothesis]:
+        batch: list[Hypothesis] = []
         try:
-            return self.primary.propose(ctx)
+            batch = self.primary.propose_batch(ctx, k)
         except Exception as exc:  # SDK/network/validation failure
             print(f"[warn] {self.primary.name} proposer failed ({exc}); "
                   f"falling back to heuristic", file=sys.stderr)
-            return self.fallback.propose(ctx)
+        if len(batch) < k:
+            used = {h.intervention.get("param") for h in batch
+                    if h.intervention.get("param") is not None}
+            for hyp in self.fallback.propose_batch(ctx, k):
+                if hyp.intervention.get("param") in used:
+                    continue
+                batch.append(hyp)
+                used.add(hyp.intervention.get("param"))
+                if len(batch) == k:
+                    break
+        return batch
+
+
+# ---------------------------------------------------------------------------
+# LLM coding worker (ClaudeCoder executor)
+# ---------------------------------------------------------------------------
+
+class CoderError(OrchestratorError):
+    """Mechanical failure of the coding-agent call itself."""
+
+
+_TOOL_PATH_FIELDS = {
+    "Read": "file_path",
+    "Write": "file_path",
+    "Edit": "file_path",
+    "Glob": "path",
+    "Grep": "path",
+}
+
+
+def _make_worktree_guard(worktree: Path, denials: list[dict]):
+    """PreToolUse hook confining the coder agent to its worktree.
+
+    cwd does NOT confine SDK tools (they accept absolute paths), so this hook
+    is the sole allower: every tool call gets an explicit allow/deny. Reads
+    are confined to the worktree — an unconfined Read would reach the root's
+    heldout_config.json (hidden seeds) and gate metrics. Writes/Edits are
+    confined to <worktree>/src. Paths are resolved via Path.resolve() (kills
+    `..` and symlink tricks) and compared with is_relative_to, never string
+    prefixes. Combined with permission_mode="dontAsk" this fails CLOSED: if
+    the hook errors or times out, the call falls through to a mode that
+    denies by default.
+    """
+    wt = worktree.resolve()
+    src = (wt / "src").resolve()
+
+    async def guard(hook_input, tool_use_id, context):  # noqa: ANN001
+        tool = (hook_input or {}).get("tool_name")
+        tool_input = (hook_input or {}).get("tool_input") or {}
+
+        def decision(allowed: bool, reason: str) -> dict:
+            if not allowed:
+                denials.append({"tool": tool, "reason": reason,
+                                "input": {k: v for k, v in tool_input.items()
+                                          if isinstance(v, str)}})
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow" if allowed else "deny",
+                    "permissionDecisionReason": reason,
+                }
+            }
+
+        field_name = _TOOL_PATH_FIELDS.get(tool) if isinstance(tool, str) else None
+        if field_name is None:
+            return decision(False, f"tool {tool!r} is not permitted")
+        raw = tool_input.get(field_name)
+        if raw is None and tool in ("Glob", "Grep"):
+            raw = "."  # these tools default to cwd
+        if not isinstance(raw, str) or not raw:
+            return decision(False, f"{tool} call missing {field_name}")
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = wt / candidate
+        resolved = candidate.resolve()
+        if tool in ("Read", "Glob", "Grep"):
+            allowed = resolved == wt or resolved.is_relative_to(wt)
+            scope = "the worktree"
+        else:  # Write / Edit
+            allowed = resolved == src or resolved.is_relative_to(src)
+            scope = "worktree src/"
+        return decision(allowed, f"{tool} {'inside' if allowed else 'outside'} "
+                                 f"{scope}: {raw}")
+
+    return guard
+
+
+CODER_SYSTEM_PROMPT = (
+    "You are a coding worker inside a constrained autoresearch loop. You "
+    "implement exactly ONE scientific hypothesis by editing code in the "
+    "current workspace, then stop. Hard constraints (violating tool calls "
+    "are denied automatically):\n"
+    "- Write/Edit only under src/ of this workspace; Read only inside this "
+    "workspace. No Bash, no network, no new dependencies (Python stdlib "
+    "only).\n"
+    "- Keep training deterministic: fixed literal seeds only; never wall "
+    "clock, os.urandom, or unseeded RNGs.\n"
+    "- The entrypoint must remain `python src/train.py`, must honor "
+    "AUTORESEARCH_SMOKE=1 (clamp to <=2 epochs), and must finish well "
+    "within 90 seconds.\n"
+    "- Preserve the `# --- HYPERPARAMS-BEGIN/END ---` marker block and the "
+    "HYPERPARAMS dict literal in src/train.py (other experiments patch it "
+    "mechanically).\n"
+    "- artifacts/model.json must keep its schema: weights (finite floats), "
+    "bias, hyperparams echo, feature_means/feature_stds (iff "
+    "feature_scaling, matching the model input count), train_rmse, "
+    "train_seconds, schema_version; optionally feature_spec — a list of "
+    "engineered-feature terms, each a list of raw-feature indices whose "
+    "PRODUCT forms one model input (max 32 terms, degree <= 3). weights "
+    "length must equal the number of terms (8 raw features if no spec).\n"
+    "- Implement only the given hypothesis; keep the diff minimal and "
+    "atomic."
+)
+
+
+class ClaudeCoder:
+    """Coding-agent executor over the Claude Agent SDK, confined to a
+    worktree by the PreToolUse guard hook (see _make_worktree_guard)."""
+
+    name = "coder"
+
+    def __init__(self, contract: ResearchContract, model: str | None = None) -> None:
+        self.contract = contract
+        self.model = model
+
+    def _options(self, worktree: Path, denials: list[dict],
+                 resume: str | None = None):
+        from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+
+        return ClaudeAgentOptions(
+            cwd=str(worktree),
+            setting_sources=[],
+            tools=["Read", "Write", "Edit", "Glob", "Grep"],
+            allowed_tools=[],  # nothing may shadow the guard hook
+            disallowed_tools=["Bash", "WebFetch", "WebSearch", "Task",
+                              "Skill", "TodoWrite", "NotebookEdit"],
+            permission_mode="dontAsk",  # hook failure -> deny (fail closed)
+            model=self.model,
+            max_turns=self.contract.portfolio.coder_max_turns,
+            max_budget_usd=self.contract.portfolio.coder_max_budget_usd,
+            system_prompt=CODER_SYSTEM_PROMPT,
+            resume=resume,
+            hooks={"PreToolUse": [HookMatcher(
+                matcher=None,
+                hooks=[_make_worktree_guard(worktree, denials)],
+                timeout=10,
+            )]},
+        )
+
+    def _run(self, prompt: str, options) -> Any:
+        import asyncio
+
+        from claude_agent_sdk import ResultMessage, query
+
+        async def go():
+            result = None
+            async for message in query(prompt=prompt, options=options):
+                if isinstance(message, ResultMessage):
+                    result = message
+            if result is None:
+                raise CoderError("no result from coder agent")
+            return result
+
+        return asyncio.run(go())
+
+    def _initial_prompt(self, hypothesis: Hypothesis, context: dict) -> str:
+        return "\n\n".join([
+            f"Hypothesis to implement:\n{json.dumps(hypothesis.to_dict(), indent=2)}",
+            f"Implementation brief:\n{hypothesis.implementation_brief}",
+            f"Incumbent dev metrics (for reference): "
+            f"{json.dumps(context.get('dev_summary') or {})}",
+            f"Recent distilled insights:\n"
+            f"{json.dumps(context.get('insights') or [], indent=2)}",
+            "The trainer is src/train.py (read it first). Acceptance: the "
+            "smoke evaluation (AUTORESEARCH_SMOKE=1, 20s) and the dev "
+            "evaluation (90s) must run your code to a valid "
+            "artifacts/model.json. When done, summarize your change in a "
+            "few sentences.",
+        ])
+
+    def execute(self, worktree: Path, hypothesis: Hypothesis,
+                context: dict) -> dict:
+        denials: list[dict] = []
+        result = self._run(self._initial_prompt(hypothesis, context),
+                           self._options(worktree, denials))
+        if result.is_error:
+            raise CoderError(f"coder agent errored: {result.result}")
+        return {
+            "summary": (result.result or "")[:500],
+            "session_id": result.session_id,
+            "cost_usd": result.total_cost_usd,
+            "denied_tool_calls": denials,
+        }
+
+    def repair(self, worktree: Path, hypothesis: Hypothesis,
+               session_id: str | None, failure_class: str,
+               stderr_tail: str) -> dict:
+        denials: list[dict] = []
+        prompt = (
+            f"The smoke evaluation of your implementation failed "
+            f"mechanically ({failure_class}). stderr tail:\n"
+            f"---\n{stderr_tail[-2000:]}\n---\n"
+            f"Fix the mechanical problem only; do NOT change the scientific "
+            f"intervention itself."
+        )
+        try:
+            result = self._run(prompt, self._options(worktree, denials,
+                                                     resume=session_id))
+        except Exception:
+            # Session resume can fail (persistence off / GC'd) — fall back to
+            # a fresh call carrying the brief again.
+            result = self._run(
+                f"{self._initial_prompt(hypothesis, {})}\n\n{prompt}",
+                self._options(worktree, denials),
+            )
+        if result.is_error:
+            raise CoderError(f"coder repair errored: {result.result}")
+        return {
+            "summary": (result.result or "")[:500],
+            "session_id": result.session_id,
+            "cost_usd": result.total_cost_usd,
+            "denied_tool_calls": denials,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -950,10 +1350,11 @@ class FallbackProposer:
 # ---------------------------------------------------------------------------
 
 def run_evaluator(guard: ProtectionGuard, workspace: Path, mode: str,
-                  out_path: Path, run_id: str, timeout_s: int) -> dict:
+                  out_path: Path, run_id: str, timeout_s: int,
+                  split: str = "dev") -> dict:
     nonce = secrets.token_hex(16)
     cmd = [sys.executable, "-B", str(EVALUATOR_PATH),
-           "--workspace", str(workspace), "--mode", mode,
+           "--workspace", str(workspace), "--mode", mode, "--split", split,
            "--out", str(out_path), "--run-id", run_id, "--nonce", nonce]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
@@ -974,6 +1375,11 @@ def run_evaluator(guard: ProtectionGuard, workspace: Path, mode: str,
     if metrics.get("nonce") != nonce:
         raise ProtectionViolation(
             f"metrics nonce mismatch for {run_id}/{mode} — possible forgery"
+        )
+    if metrics.get("split") != split:
+        raise ProtectionViolation(
+            f"split echo mismatch for {run_id}: asked {split!r}, evaluator "
+            f"reports {metrics.get('split')!r}"
         )
     manifest_files = guard.load_manifest()["files"]
     expected = manifest_files.get("evaluation/evaluate.py")
@@ -1003,13 +1409,21 @@ def run_evaluator(guard: ProtectionGuard, workspace: Path, mode: str,
 
 def load_state() -> dict:
     try:
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise OrchestratorError(
             "no experiments/state.json — run `orchestrator.py init` first"
         ) from None
     except json.JSONDecodeError as exc:
         raise OrchestratorError(f"state.json corrupt: {exc}") from None
+    version = state.get("schema_version")
+    if version != STATE_SCHEMA_VERSION:
+        raise OrchestratorError(
+            f"state.json schema v{version} unsupported (this orchestrator "
+            f"needs v{STATE_SCHEMA_VERSION}) — start a fresh campaign with "
+            f"`orchestrator.py init --force`"
+        )
+    return state
 
 
 def save_state(state: dict) -> None:
@@ -1038,48 +1452,76 @@ def classify(metrics: dict, best_primary: float | None,
 
 
 def distill_insight(record: dict) -> dict | None:
+    """Distill one proposer-visible lesson from an experiment record.
+
+    BLINDNESS INVARIANT: this function must never read gate data — gate
+    scores live only in record_type="gate" records (which return None at the
+    first check below) and gate metrics files. An experiment's admission
+    outcome is visible only as the accept/reject bit, which is inherently
+    observable through incumbent movement anyway.
+    """
     if record.get("record_type") != "experiment":
         return None
     hyp = record.get("hypothesis") or {}
-    intervention = hyp.get("intervention", {})
+    intervention = hyp.get("intervention") or {}
     param = intervention.get("param")
     frm, to = intervention.get("from"), intervention.get("to")
     verdict = record.get("verdict")
+    decision = record.get("decision")
     fc = record.get("failure_class")
     before = record.get("best_primary_before")
     primary = record.get("primary")
 
     before_txt = f"{before:.4f}" if isinstance(before, (int, float)) else "?"
     primary_txt = f"{primary:.4f}" if isinstance(primary, (int, float)) else "n/a"
+    if param is not None:
+        desc = f"{param} {frm!r}->{to!r}"
+    else:
+        desc = f"coder: {(hyp.get('statement') or 'code intervention')[:80]}"
 
-    if verdict == "valid_positive":
-        observation = (f"{param} {frm!r}->{to!r} improved heldout_rmse "
-                       f"{before_txt}->{primary_txt}; accepted.")
-        follow_up = f"continue moving {param} in this direction"
+    if verdict == "valid_positive" and decision == "accept":
+        observation = (f"{desc} improved heldout_rmse "
+                       f"{before_txt}->{primary_txt} and was admitted.")
+        follow_up = (f"continue moving {param} in this direction"
+                     if param is not None else
+                     "build on this code change in later hypotheses")
         confidence = 0.8
+    elif verdict == "valid_positive":
+        observation = (f"{desc} improved the dev split "
+                       f"{before_txt}->{primary_txt} but was NOT admitted by "
+                       f"the blind gate this generation.")
+        follow_up = ("dev-split gains of this size may not generalize; "
+                     "prefer interventions with a stronger mechanism")
+        confidence = 0.6
     elif fc in ("degenerate_weights", "no_skill"):
-        observation = (f"{param} {frm!r}->{to!r} made training degenerate "
-                       f"({fc}); optimization left the stable region.")
-        follow_up = f"treat {to!r} as an upper bound for {param} in this regime"
+        observation = (f"{desc} made training degenerate ({fc}); "
+                       f"optimization left the stable region.")
+        follow_up = (f"treat {to!r} as an upper bound for {param} in this regime"
+                     if param is not None else
+                     "this code direction destabilizes training")
         confidence = 0.9
     elif fc in ("timeout", "nonzero_exit"):
-        observation = (f"{param} {frm!r}->{to!r} made the run fail "
-                       f"({fc}) despite a valid patch — the intervention "
-                       f"itself is infeasible under the budget.")
-        follow_up = f"avoid pushing {param} further this way"
+        observation = (f"{desc} made the run fail ({fc}) despite a valid "
+                       f"implementation — infeasible under the budget.")
+        follow_up = (f"avoid pushing {param} further this way"
+                     if param is not None else
+                     "keep code changes within the training budget")
         confidence = 0.7
     elif verdict == "valid_negative":
-        observation = (f"{param} {frm!r}->{to!r} regressed heldout_rmse "
+        observation = (f"{desc} regressed heldout_rmse "
                        f"{before_txt}->{primary_txt}; rejected.")
-        follow_up = f"deprioritize this direction for {param}"
+        follow_up = (f"deprioritize this direction for {param}"
+                     if param is not None else
+                     "deprioritize this code direction")
         confidence = 0.7
     elif verdict == "valid_inconclusive":
-        observation = (f"{param} {frm!r}->{to!r} changed heldout_rmse "
+        observation = (f"{desc} changed heldout_rmse "
                        f"{before_txt}->{primary_txt}, below the "
                        f"min_relative_improvement threshold.")
-        follow_up = f"{param} is not the binding constraint near this optimum"
+        follow_up = "not the binding constraint near this optimum"
         confidence = 0.5
-    elif verdict in ("invalid_implementation", "contract_violation", "aborted"):
+    elif verdict in ("invalid_implementation", "contract_violation",
+                     "ff_conflict", "aborted"):
         observation = (f"round {record.get('run_id')} ended as {verdict} "
                        f"({fc or 'no failure class'}) — no scientific signal.")
         follow_up = "no scientific conclusion; mechanical/protocol issue"
@@ -1089,13 +1531,15 @@ def distill_insight(record: dict) -> dict | None:
 
     return {
         "insight_id": f"ins_{record.get('run_id', '?')}",
-        "scope": "sgd hyperparameter tuning on synthetic heteroscale regression",
+        "scope": "synthetic heteroscale regression (hyperparams + src/** code)",
         "round": record.get("round"),
+        "generation": record.get("generation"),
         "hypothesis_id": hyp.get("id"),
         "observation": observation,
         "outcome": verdict,
         "failure_class": fc,
-        "conditions": {"param": param, "from": frm, "to": to},
+        "conditions": {"param": param, "from": frm, "to": to,
+                       "executor": record.get("executor", "patcher")},
         "recommended_follow_up": follow_up,
         "supporting_run_ids": [record.get("run_id")],
         "confidence": confidence,
@@ -1132,8 +1576,14 @@ def replay_ledger_fields(state: dict, records: list[dict]) -> None:
     """
     corrected = corrected_run_ids(records)
     tested: dict[str, list[str]] = {}
-    stagnation = 0
-    last_accepted = None
+    max_generation = 0
+
+    # Stagnation counts GENERATIONS without an admitted winner, so records
+    # must be grouped by generation before replay. Legacy records without a
+    # generation field each form a singleton group in file order (exact
+    # Phase 1 semantics).
+    groups: list[list[dict]] = []
+    group_index: dict[int, int] = {}
     for r in records:
         if r.get("record_type") != "experiment" or r.get("verdict") == "aborted":
             continue
@@ -1145,18 +1595,41 @@ def replay_ledger_fields(state: dict, records: list[dict]) -> None:
                 vr = value_repr(v)
                 if vr not in values:
                     values.append(vr)
-        if r.get("decision") == "accept" and r.get("run_id") not in corrected:
+        generation = r.get("generation")
+        if isinstance(generation, int):
+            max_generation = max(max_generation, generation)
+            if generation not in group_index:
+                group_index[generation] = len(groups)
+                groups.append([])
+            groups[group_index[generation]].append(r)
+        else:
+            groups.append([r])
+
+    stagnation = 0
+    last_accepted = None
+    for group in groups:
+        winner = next(
+            (r for r in group
+             if r.get("decision") == "accept"
+             and r.get("run_id") not in corrected),
+            None,
+        )
+        if winner is not None:
             stagnation = 0
-            last_accepted = dict(intervention)
+            last_accepted = dict(
+                (winner.get("hypothesis") or {}).get("intervention") or {}
+            )
         else:
             stagnation += 1
+
     state["tested"] = tested
     state["stagnation"] = stagnation
     state["last_accepted"] = last_accepted
+    state["generation"] = max(state.get("generation") or 0, max_generation)
 
 
 # ---------------------------------------------------------------------------
-# Round execution
+# Generation execution (parallel hypothesis portfolio)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -1166,243 +1639,598 @@ class LoopContext:
     guard: ProtectionGuard
     patcher: HyperparamsPatcher
     proposer: Any
+    coder: ClaudeCoder | None = None
 
 
-def _finish_round(ctx: LoopContext, state: dict, record: dict,
-                  wt_path: Path, branch: str, delete_branch: bool) -> dict:
-    """Merge guard, write-ahead ledger record, then merge/cleanup/state."""
-    if record["decision"] == "accept":
-        # Pre-flight the merge guard BEFORE the write-ahead record: an accept
-        # that cannot land (main moved/dirty mid-round) must never enter the
-        # ledger as accepted — it would poison insights and replay forever.
+@dataclass
+class ExperimentSpec:
+    run_id: str
+    generation: int
+    hypothesis: Hypothesis
+    branch: str
+    worktree: Path
+    round_dir: Path
+    base_commit: str
+    insights: list[dict] = field(default_factory=list)
+
+
+# Smoke-stage failure classes meaning "no scoreable model was ever produced"
+# — the coder-era analogue of PatchError, and the ONLY repairable outcomes.
+# timeout / degenerate_weights / no_skill / any dev-stage failure are
+# scientific evidence and are never repaired (false-repair prevention).
+MECHANICAL_FAILURES = {"nonzero_exit", "missing_artifact", "malformed_artifact"}
+
+MAX_DIFF_BYTES = 200_000
+
+
+def _glob_violations(ctx: LoopContext, spec: "ExperimentSpec") -> list[str]:
+    paths = set(ctx.git.diff_paths(spec.base_commit, cwd=spec.worktree))
+    paths.update(ctx.git.status_paths(cwd=spec.worktree))
+    return [p for p in sorted(paths)
+            if matches_any(p, ctx.contract.protected_globs)
+            or not matches_any(p, ctx.contract.editable_globs)]
+
+
+def _root_fingerprint(ctx: LoopContext) -> tuple:
+    """Snapshot of the ROOT checkout used to detect coder escape. Combines
+    git status (tracked + untracked) with the protection manifest so a rogue
+    absolute-path write to ROOT/src/** (editable, so NOT in the manifest) is
+    still caught as a status change."""
+    return (tuple(ctx.git.status_paths()), tuple(ctx.guard.verify()))
+
+
+def _assert_root_unchanged(run_id: str, before: tuple, after: tuple) -> None:
+    """After any coder invocation: cwd does not confine absolute-path tool
+    calls, so a mutation of the ROOT checkout means containment failed and
+    every later round's baseline is suspect. Compare against the pre-call
+    snapshot (root may legitimately carry pre-existing untracked files) and
+    halt the campaign on any coder-introduced change."""
+    if after != before:
+        new_status = set(after[0]) - set(before[0])
+        new_viol = set(after[1]) - set(before[1])
+        raise ProtectionViolation(
+            f"root working tree mutated during coder round {run_id}: "
+            f"status={sorted(new_status)} protection={sorted(new_viol)}"
+        )
+
+
+def _scan_src_symlinks(worktree: Path) -> list[str]:
+    """A symlink under src/ passes the editable-glob check by path while
+    redirecting content elsewhere; reject outright."""
+    bad = []
+    for dirpath, dirnames, filenames in os.walk(worktree / "src"):
+        for name in dirnames + filenames:
+            p = Path(dirpath) / name
+            if p.is_symlink():
+                bad.append(p.relative_to(worktree).as_posix())
+    return bad
+
+
+def _commit_worktree(ctx: LoopContext, spec: "ExperimentSpec",
+                     message: str) -> tuple[str | None, str | None]:
+    """Returns (commit, failure); failure='empty_diff' when nothing changed."""
+    ctx.git.run("add", "-A", cwd=spec.worktree)
+    proc = ctx.git.run("commit", "-m", message, cwd=spec.worktree, check=False)
+    if proc.returncode != 0:
+        output = proc.stdout + proc.stderr
+        if "nothing to commit" in output or "nothing added to commit" in output:
+            return None, "empty_diff"
+        raise GitError(f"worktree commit failed: {output.strip()}")
+    return ctx.git.head(cwd=spec.worktree), None
+
+
+def _finish_generation(ctx: LoopContext, state: dict,
+                       specs: list["ExperimentSpec"], records: list[dict],
+                       gate_record: dict, winner_run_id: str | None) -> dict:
+    """Merge-guard preflight, write-ahead ledger batch (gate first), merge,
+    state update, cleanup — the single persistence path per generation."""
+    winner = next((r for r in records if r["run_id"] == winner_run_id), None)
+
+    if winner is not None:
+        # Pre-flight BEFORE the write-ahead batch: an accept that cannot land
+        # (main moved/dirty mid-generation) must never enter the ledger as
+        # accepted — it would poison insights and replay forever.
         head = ctx.git.head()
         dirty = ctx.git.status_paths(include_untracked=False)
-        if head != record["base_commit"] or dirty:
-            record["verdict"] = "ff_conflict"
-            record["failure_class"] = (
-                f"main moved during round "
-                f"({record['base_commit'][:12]} -> {head[:12]})"
-                if head != record["base_commit"]
+        if head != winner["base_commit"] or dirty:
+            winner["verdict"] = "ff_conflict"
+            winner["failure_class"] = (
+                f"main moved during generation "
+                f"({winner['base_commit'][:12]} -> {head[:12]})"
+                if head != winner["base_commit"]
                 else f"main working tree dirty: {dirty}"
             )
-            record["decision"] = "reject"
-            record["best_primary_after"] = state.get("best_primary")
+            gate_record["winner"] = None
+            gate_record["reason"] = (gate_record.get("reason") or "") + \
+                " (demoted: merge guard failed)"
+            winner = None
 
-    append_jsonl(LEDGER_PATH, record)
+    for r in records:
+        r["decision"] = ("accept" if winner is not None and r is winner
+                         else "reject")
+        r["best_primary_after"] = (
+            r["primary"] if r["decision"] == "accept"
+            else state.get("best_primary")
+        )
 
-    if record["decision"] == "accept":
+    # Write-ahead batch: the gate record FIRST, so any accept record that
+    # exists always has its admission provenance; then experiments in run
+    # order. Recovery keys off experiment decisions only.
+    append_jsonl(LEDGER_PATH, gate_record)
+    for r in records:
+        append_jsonl(LEDGER_PATH, r)
+
+    if winner is not None:
         try:
-            ctx.git.merge_ff(record["commit"])
+            ctx.git.merge_ff(winner["commit"])
         except GitError as exc:
-            # Compensating record: recovery/replay must not treat this round
-            # as an accepted improvement.
             append_jsonl(LEDGER_PATH, {
                 "record_type": "correction",
-                "corrects": record["run_id"],
+                "corrects": winner["run_id"],
                 "timestamp_utc": utc_now(),
                 "reason": f"ff-merge failed after accept was recorded: {exc}",
             })
             raise
-        state["best_primary"] = record["primary"]
-        state["best_commit"] = record["commit"]
+        # best_primary is the DEV score — never the gate score, which must
+        # not flow into proposer-visible state.
+        state["best_primary"] = winner["primary"]
+        state["best_commit"] = winner["commit"]
         state["stagnation"] = 0
-        state["last_accepted"] = dict(record["hypothesis"]["intervention"])
+        state["last_accepted"] = dict(winner["hypothesis"]["intervention"])
+        winner_gate = (gate_record.get("results") or {}).get(winner["run_id"])
+        if winner_gate is not None:
+            state.setdefault("gate", {}).setdefault("incumbent_scores", {})[
+                winner["commit"]] = winner_gate
     else:
         state["stagnation"] = state.get("stagnation", 0) + 1
 
-    # Register both endpoints as tested: the to-value was just measured, and
-    # the from-value's config is the incumbent whose score is already known —
-    # this also prevents proposing a plain revert of an accepted change.
-    intervention = record["hypothesis"]["intervention"]
-    tested_values = state.setdefault("tested", {}).setdefault(
-        intervention["param"], []
-    )
-    for v in (value_repr(intervention["to"]), value_repr(intervention["from"])):
-        if v not in tested_values:
-            tested_values.append(v)
+    # Register both endpoints as tested for every completed hyperparameter
+    # experiment (winner and losers alike, including gate-rejected ones).
+    for r in records:
+        if r.get("verdict") == "aborted":
+            continue
+        intervention = (r.get("hypothesis") or {}).get("intervention") or {}
+        param = intervention.get("param")
+        if param is None:
+            continue  # coder hypotheses have no single-param endpoint
+        values = state.setdefault("tested", {}).setdefault(param, [])
+        for v in (value_repr(intervention.get("to")),
+                  value_repr(intervention.get("from"))):
+            if v not in values:
+                values.append(v)
 
-    ctx.git.worktree_remove(wt_path)
-    if delete_branch and ctx.git.branch_exists(branch):
-        ctx.git.delete_branch(branch)
+    state["generation"] = gate_record["generation"]
+
+    # Worktrees BEFORE branch deletion: git refuses to delete a branch that
+    # is checked out in a live worktree.
+    for spec in specs:
+        ctx.git.worktree_remove(spec.worktree)
+    for spec, r in zip(specs, records):
+        if (r.get("verdict") == "invalid_implementation"
+                and ctx.git.branch_exists(spec.branch)):
+            ctx.git.delete_branch(spec.branch)
 
     rebuild_insights()
-    state["current_round"] = None
+    state["current_generation"] = None
     save_state(state)
-    return record
+    return {"records": records, "gate": gate_record,
+            "winner": winner["run_id"] if winner is not None else None}
 
 
-def run_round(ctx: LoopContext, state: dict) -> dict | None:
-    """Execute one keep/reject round. Returns the ledger record, or None if
-    the proposer's move space is exhausted."""
+def run_experiment(ctx: LoopContext, spec: ExperimentSpec,
+                   best_primary_snapshot: float | None) -> dict:
+    """Worker-thread body for one hypothesis. Touches ONLY its own worktree
+    and round dir; all state/ledger persistence happens on the main thread
+    after the generation barrier. Classification compares against the
+    generation-start incumbent snapshot so all K see the same target."""
     contract = ctx.contract
     pm = contract.primary_metric
-
-    violations = ctx.guard.verify()
-    if violations:
-        raise ProtectionViolation("; ".join(violations))
-
-    current_hp = ctx.patcher.read(ROOT / TRAIN_REL)
-    round_index = state["round"] + 1
-    proposal = ctx.proposer.propose(ProposalContext(
-        contract=contract,
-        round_index=round_index,
-        current_hyperparams=current_hp,
-        best_primary=state.get("best_primary"),
-        tested=state.get("tested", {}),
-        last_accepted=state.get("last_accepted"),
-        insights=read_insights(),
-    ))
-    if proposal is None:
-        return None
-
-    run_id = f"r{round_index:04d}"
-    # Branch names are namespaced by campaign so that `init --force` (a new
-    # campaign, round counter reset) never collides with retained provenance
-    # branches from earlier campaigns.
-    campaign = state.get("campaign_id", "c0")
-    branch = f"hyp/{campaign}/{run_id}-{proposal.intervention['param']}"
-    wt_path = WORKTREES_DIR / run_id
-    round_dir = ROUNDS_DIR / run_id
-    round_dir.mkdir(parents=True, exist_ok=True)
-    base_commit = ctx.git.head()
-
-    # Round numbers are never reused: persist the marker before any git work.
-    state["round"] = round_index
-    state["current_round"] = {
-        "run_id": run_id, "branch": branch, "worktree": str(wt_path),
-        "base_commit": base_commit, "phase": "started", "started_utc": utc_now(),
-    }
-    save_state(state)
-
-    atomic_write_json(round_dir / "hypothesis.json", proposal.to_dict())
+    hyp = spec.hypothesis
 
     record: dict = {
         "record_type": "experiment",
-        "run_id": run_id,
-        "round": round_index,
+        "run_id": spec.run_id,
+        "round": int(spec.run_id[1:]),
+        "generation": spec.generation,
         "timestamp_utc": utc_now(),
-        "hypothesis": proposal.to_dict(),
-        "branch": branch,
-        "base_commit": base_commit,
+        "hypothesis": hyp.to_dict(),
+        "executor": hyp.executor,
+        "branch": spec.branch,
+        "base_commit": spec.base_commit,
         "commit": None,
         "verdict": None,
         "failure_class": None,
         "decision": "reject",
         "primary": None,
-        "best_primary_before": state.get("best_primary"),
+        "best_primary_before": best_primary_snapshot,
         "metrics_path": None,
-        "proposer": proposal.proposer,
-        "proposal_cost_usd": getattr(ctx.proposer, "last_cost_usd", None)
-        if proposal.proposer == "claude"
-        else None,
+        "proposer": hyp.proposer,
     }
 
-    if ctx.git.branch_exists(branch):
-        raise GitError(f"branch {branch} already exists — recovery did not run?")
-    ctx.git.worktree_add(wt_path, branch, base_commit)
-
-    # --- patch, with bounded MECHANICAL repair only -------------------------
-    param = proposal.intervention["param"]
-    new_value = proposal.intervention["to"]
-    train_file = wt_path / TRAIN_REL
-    patch_error: PatchError | None = None
-    for attempt in range(contract.budgets.repair_attempts + 1):
+    # --- implement ------------------------------------------------------------
+    session_id: str | None = None
+    if hyp.executor == "coder":
+        if ctx.coder is None:
+            record.update(verdict="invalid_implementation",
+                          failure_class="coder_unavailable")
+            return record
+        root_before = _root_fingerprint(ctx)
         try:
-            ctx.patcher.apply(train_file, param, new_value, attempt=attempt)
-            patch_error = None
-            break
-        except PatchError as exc:
-            patch_error = exc
-            ctx.git.run("checkout", "--", TRAIN_REL, cwd=wt_path, check=False)
-    if patch_error is not None:
-        record["verdict"] = "invalid_implementation"
-        record["failure_class"] = f"patch_failed: {patch_error}"
-        return _finish_round(ctx, state, record, wt_path, branch,
-                             delete_branch=True)
+            coder_result = ctx.coder.execute(
+                spec.worktree, hyp, {"insights": spec.insights},
+            )
+        except CoderError as exc:
+            _assert_root_unchanged(spec.run_id, root_before,
+                                   _root_fingerprint(ctx))
+            record.update(verdict="invalid_implementation",
+                          failure_class=f"coder_error: {exc}")
+            return record
+        _assert_root_unchanged(spec.run_id, root_before, _root_fingerprint(ctx))
+        session_id = coder_result.get("session_id")
+        record["coder"] = {
+            "cost_usd": coder_result.get("cost_usd"),
+            "summary": coder_result.get("summary"),
+            "repairs": 0,
+            "denied_tool_calls": len(coder_result.get("denied_tool_calls") or []),
+        }
+    else:
+        param = hyp.intervention["param"]
+        new_value = hyp.intervention["to"]
+        train_file = spec.worktree / TRAIN_REL
+        patch_error: PatchError | None = None
+        for attempt in range(contract.budgets.repair_attempts + 1):
+            try:
+                ctx.patcher.apply(train_file, param, new_value, attempt=attempt)
+                patch_error = None
+                break
+            except PatchError as exc:
+                patch_error = exc
+                ctx.git.run("checkout", "--", TRAIN_REL, cwd=spec.worktree,
+                            check=False)
+        if patch_error is not None:
+            record.update(verdict="invalid_implementation",
+                          failure_class=f"patch_failed: {patch_error}")
+            return record
 
-    ctx.git.run("add", "-A", cwd=wt_path)
-    commit_proc = ctx.git.run(
-        "commit", "-m",
-        f"{run_id}: {param} {current_hp[param]!r} -> {new_value!r}\n\n"
-        f"Hypothesis: {proposal.statement}",
-        cwd=wt_path, check=False,
+    bad_links = _scan_src_symlinks(spec.worktree)
+    if bad_links:
+        record.update(verdict="contract_violation",
+                      failure_class=f"symlink under src/: {bad_links}")
+        return record
+
+    commit, failure = _commit_worktree(
+        ctx, spec, f"{spec.run_id}: {hyp.statement[:100]}\n\n"
+                   f"Hypothesis: {hyp.statement}",
     )
-    if commit_proc.returncode != 0:
-        output = commit_proc.stdout + commit_proc.stderr
-        if "nothing to commit" in output or "nothing added to commit" in output:
-            # No-op patch (e.g., proposed value already in HEAD): mechanical.
-            record["verdict"] = "invalid_implementation"
-            record["failure_class"] = "empty_diff"
-            return _finish_round(ctx, state, record, wt_path, branch,
-                                 delete_branch=True)
-        raise GitError(f"worktree commit failed: {output.strip()}")
-    commit = ctx.git.head(cwd=wt_path)
+    if failure:
+        record.update(verdict="invalid_implementation", failure_class=failure)
+        return record
     record["commit"] = commit
-    state["current_round"]["phase"] = "committed"
-    save_state(state)
 
-    changed = ctx.git.diff_paths(base_commit, cwd=wt_path)
-    if not changed:
-        record["verdict"] = "invalid_implementation"
-        record["failure_class"] = "empty_diff"
-        return _finish_round(ctx, state, record, wt_path, branch,
-                             delete_branch=True)
+    diff_bytes = len(ctx.git.run("diff", f"{spec.base_commit}..HEAD",
+                                 cwd=spec.worktree).stdout.encode())
+    if diff_bytes > MAX_DIFF_BYTES:
+        record.update(verdict="invalid_implementation",
+                      failure_class=f"oversized_diff: {diff_bytes} bytes")
+        return record
 
-    def glob_violations() -> list[str]:
-        paths = set(ctx.git.diff_paths(base_commit, cwd=wt_path))
-        paths.update(ctx.git.status_paths(cwd=wt_path))
-        bad = [p for p in sorted(paths)
-               if matches_any(p, contract.protected_globs)
-               or not matches_any(p, contract.editable_globs)]
-        return bad
-
-    bad = glob_violations()
+    bad = _glob_violations(ctx, spec)
     if bad:
-        record["verdict"] = "contract_violation"
-        record["failure_class"] = f"pre-eval protected/editable violation: {bad}"
-        return _finish_round(ctx, state, record, wt_path, branch,
-                             delete_branch=False)
+        record.update(verdict="contract_violation",
+                      failure_class=f"pre-eval protected/editable violation: {bad}")
+        return record
 
-    # --- evaluate: smoke, then dev ------------------------------------------
-    smoke = run_evaluator(ctx.guard, wt_path, "smoke",
-                          round_dir / "metrics_smoke.json", run_id,
-                          contract.budgets.smoke_train_timeout_s)
-    record["smoke_metrics_path"] = str(round_dir / "metrics_smoke.json")
+    # --- smoke, with bounded coder repair for MECHANICAL failures only --------
+    smoke_path = spec.round_dir / "metrics_smoke.json"
+    smoke = run_evaluator(ctx.guard, spec.worktree, "smoke", smoke_path,
+                          spec.run_id, contract.budgets.smoke_train_timeout_s)
+    record["smoke_metrics_path"] = str(smoke_path)
+
+    repairs = 0
+    while (hyp.executor == "coder" and ctx.coder is not None
+           and smoke.get("failure_class") in MECHANICAL_FAILURES
+           and repairs < contract.budgets.repair_attempts):
+        repairs += 1
+        root_before = _root_fingerprint(ctx)
+        try:
+            repair_result = ctx.coder.repair(
+                spec.worktree, hyp, session_id,
+                str(smoke.get("failure_class")),
+                str(smoke.get("stderr_tail") or ""),
+            )
+        except CoderError as exc:
+            record["failure_class"] = f"coder_repair_error: {exc}"
+            break
+        _assert_root_unchanged(spec.run_id, root_before, _root_fingerprint(ctx))
+        session_id = repair_result.get("session_id") or session_id
+        record["coder"]["repairs"] = repairs
+        record["coder"]["denied_tool_calls"] += len(
+            repair_result.get("denied_tool_calls") or [])
+        bad_links = _scan_src_symlinks(spec.worktree)
+        if bad_links:
+            record.update(verdict="contract_violation",
+                          failure_class=f"symlink under src/: {bad_links}")
+            return record
+        commit, failure = _commit_worktree(
+            ctx, spec, f"{spec.run_id}: mechanical repair attempt {repairs}")
+        if failure is None:
+            record["commit"] = commit
+        bad = _glob_violations(ctx, spec)
+        if bad:
+            record.update(verdict="contract_violation",
+                          failure_class=f"post-repair violation: {bad}")
+            return record
+        smoke = run_evaluator(ctx.guard, spec.worktree, "smoke", smoke_path,
+                              spec.run_id,
+                              contract.budgets.smoke_train_timeout_s)
 
     if not smoke.get("executed") or smoke.get("degenerate"):
-        verdict, failure_class, primary = classify(
-            smoke, state.get("best_primary"), pm
-        )
-        record.update(verdict=verdict, failure_class=failure_class,
-                      primary=primary,
-                      metrics_path=str(round_dir / "metrics_smoke.json"))
-    else:
-        dev = run_evaluator(ctx.guard, wt_path, "dev",
-                            round_dir / "metrics_dev.json", run_id,
-                            contract.budgets.dev_train_timeout_s)
-        verdict, failure_class, primary = classify(
-            dev, state.get("best_primary"), pm
-        )
-        record.update(verdict=verdict, failure_class=failure_class,
-                      primary=primary,
-                      metrics_path=str(round_dir / "metrics_dev.json"))
+        if (hyp.executor == "coder"
+                and smoke.get("failure_class") in MECHANICAL_FAILURES):
+            # Repair budget exhausted without ever producing a scoreable
+            # model: mechanical, not scientific.
+            record.update(verdict="invalid_implementation",
+                          failure_class=f"smoke_{smoke.get('failure_class')}",
+                          metrics_path=str(smoke_path))
+        else:
+            verdict, failure_class, primary = classify(
+                smoke, best_primary_snapshot, pm)
+            record.update(verdict=verdict, failure_class=failure_class,
+                          primary=primary, metrics_path=str(smoke_path))
+        return record
 
-    # --- post-evaluation tamper check ----------------------------------------
-    bad = glob_violations()
+    # --- dev --------------------------------------------------------------------
+    dev_path = spec.round_dir / "metrics_dev.json"
+    dev = run_evaluator(ctx.guard, spec.worktree, "dev", dev_path,
+                        spec.run_id, contract.budgets.dev_train_timeout_s)
+    verdict, failure_class, primary = classify(dev, best_primary_snapshot, pm)
+    record.update(verdict=verdict, failure_class=failure_class,
+                  primary=primary, metrics_path=str(dev_path))
+
+    # --- post-evaluation tamper check --------------------------------------------
+    bad = _glob_violations(ctx, spec)
     if bad:
-        record["verdict"] = "contract_violation"
-        record["failure_class"] = f"post-eval protected/editable violation: {bad}"
-        record["decision"] = "reject"
-        return _finish_round(ctx, state, record, wt_path, branch,
-                             delete_branch=False)
+        record.update(verdict="contract_violation",
+                      failure_class=f"post-eval protected/editable violation: {bad}")
+    return record
 
-    record["decision"] = "accept" if record["verdict"] == "valid_positive" else "reject"
-    record["best_primary_after"] = (
-        record["primary"] if record["decision"] == "accept"
-        else state.get("best_primary")
-    )
-    return _finish_round(ctx, state, record, wt_path, branch,
-                         delete_branch=False)
+
+def _run_gate(ctx: LoopContext, state: dict, records: list[dict],
+              generation: int, base_commit: str) -> tuple[dict, str | None]:
+    """Blind admission gate over the generation's dev improvers.
+
+    Gate scores live ONLY in this record and the gate metrics files — never
+    in experiment records, insights, or proposer context (blindness by
+    construction: everything proposer-visible is derived from experiment
+    records, which carry no gate fields)."""
+    contract = ctx.contract
+    pm = contract.primary_metric
+    pf = contract.portfolio
+
+    gate_record: dict = {
+        "record_type": "gate",
+        "generation": generation,
+        "timestamp_utc": utc_now(),
+        "base_commit": base_commit,
+        "candidates": [],
+        "incumbent_gate": None,
+        "incumbent_evaluated": False,
+        "results": {},
+        "winner": None,
+        "reason": None,
+        "selection_rule": (
+            f"winner = best gate-split improver over the incumbent's gate "
+            f"score by >= {pf.gate_min_relative_improvement:.2%} relative, "
+            f"among the top {pf.gate_top_k} dev improvers"
+        ),
+    }
+
+    improvers = [r for r in records if r.get("verdict") == "valid_positive"
+                 and isinstance(r.get("primary"), float)]
+    improvers.sort(key=lambda r: r["primary"],
+                   reverse=pm.direction == "maximize")
+    candidates = improvers[: pf.gate_top_k]
+    gate_record["candidates"] = [r["run_id"] for r in candidates]
+    if not candidates:
+        gate_record["reason"] = "no dev improvers"
+        return gate_record, None
+
+    gate_dir = EXPERIMENTS_DIR / "generations" / f"g{generation:04d}" / "gate"
+
+    # Determinism recheck for gate-bound candidates only: coder-authored code
+    # can smuggle nondeterminism past PYTHONHASHSEED, and the epsilon
+    # keep-rule's justification depends on (config -> score) being pure.
+    verified = []
+    for r in candidates:
+        recheck = run_evaluator(
+            ctx.guard, WORKTREES_DIR / r["run_id"], "dev",
+            gate_dir / f"{r['run_id']}_dev_recheck.json", r["run_id"],
+            contract.budgets.dev_train_timeout_s,
+        )
+        if (recheck.get("primary_metric") or {}).get("value") != r["primary"]:
+            r["verdict"] = "invalid_implementation"
+            r["failure_class"] = "nondeterministic"
+            r["primary"] = None
+            continue
+        verified.append(r)
+    if not verified:
+        gate_record["reason"] = "all candidates failed the determinism recheck"
+        return gate_record, None
+
+    # Incumbent gate score, cached per commit. Evaluation is a pure function
+    # of (commit, split seed, evaluator hash), so the cache is exact, not an
+    # approximation. ROOT sits at base_commit and clean here (cmd_run's dirty
+    # check + nothing merges mid-generation).
+    cache = state.setdefault("gate", {}).setdefault("incumbent_scores", {})
+    incumbent_gate = cache.get(base_commit)
+    if incumbent_gate is None:
+        metrics = run_evaluator(ctx.guard, ROOT, "dev",
+                                gate_dir / "incumbent.json",
+                                f"g{generation:04d}-incumbent",
+                                contract.budgets.dev_train_timeout_s,
+                                split="gate")
+        incumbent_gate = (metrics.get("primary_metric") or {}).get("value")
+        if incumbent_gate is None:
+            raise EvaluatorInfraError("incumbent gate evaluation failed")
+        cache[base_commit] = incumbent_gate
+        gate_record["incumbent_evaluated"] = True
+    gate_record["incumbent_gate"] = incumbent_gate
+
+    best_record: dict | None = None
+    best_value: float | None = None
+    for r in verified:
+        metrics = run_evaluator(ctx.guard, WORKTREES_DIR / r["run_id"], "dev",
+                                gate_dir / f"{r['run_id']}.json", r["run_id"],
+                                contract.budgets.dev_train_timeout_s,
+                                split="gate")
+        value = (metrics.get("primary_metric") or {}).get("value")
+        gate_record["results"][r["run_id"]] = value
+        if value is None:
+            continue
+        if pm.direction == "minimize":
+            rel = (incumbent_gate - value) / abs(incumbent_gate)
+            better = best_value is None or value < best_value
+        else:
+            rel = (value - incumbent_gate) / abs(incumbent_gate)
+            better = best_value is None or value > best_value
+        if rel >= pf.gate_min_relative_improvement and better:
+            best_record, best_value = r, value
+
+    if best_record is not None:
+        gate_record["winner"] = best_record["run_id"]
+        gate_record["reason"] = "beat the incumbent on the blind gate split"
+    else:
+        gate_record["reason"] = "no candidate beat the incumbent on the gate split"
+    return gate_record, gate_record["winner"]
+
+
+def run_generation(ctx: LoopContext, state: dict) -> dict | None:
+    """Execute one parallel portfolio generation. Returns a summary dict
+    ({"stop": reason} for budget stops), or None when the proposer's move
+    space is exhausted."""
+    contract = ctx.contract
+    pf = contract.portfolio
+
+    violations = ctx.guard.verify()
+    if violations:
+        raise ProtectionViolation("; ".join(violations))
+
+    k_budget = min(pf.parallel_branches,
+                   contract.budgets.max_rounds - state["round"])
+    if k_budget <= 0:
+        return {"stop": "max_rounds"}
+
+    generation = state.get("generation", 0) + 1
+    insights = read_insights()
+    batch = ctx.proposer.propose_batch(ProposalContext(
+        contract=contract,
+        round_index=state["round"] + 1,
+        current_hyperparams=ctx.patcher.read(ROOT / TRAIN_REL),
+        best_primary=state.get("best_primary"),
+        tested=state.get("tested", {}),
+        last_accepted=state.get("last_accepted"),
+        insights=insights,
+    ), k_budget)
+    if not batch:
+        return None
+
+    campaign = state.get("campaign_id", "c0")
+    base_commit = ctx.git.head()
+    specs: list[ExperimentSpec] = []
+    for i, hyp in enumerate(batch):
+        rnum = state["round"] + 1 + i
+        run_id = f"r{rnum:04d}"
+        hyp.round = rnum
+        hyp.id = f"h_{run_id}_{_slug(hyp)}"
+        specs.append(ExperimentSpec(
+            run_id=run_id,
+            generation=generation,
+            hypothesis=hyp,
+            branch=f"hyp/{campaign}/{run_id}-{_slug(hyp)}",
+            worktree=WORKTREES_DIR / run_id,
+            round_dir=ROUNDS_DIR / run_id,
+            base_commit=base_commit,
+            insights=insights[-5:],
+        ))
+
+    # Write-ahead point 1: reserve the contiguous rNNNN block + generation
+    # marker BEFORE any git work; round numbers are never reused.
+    state["round"] += len(specs)
+    state["current_generation"] = {
+        "generation": generation,
+        "base_commit": base_commit,
+        "phase": "started",
+        "started_utc": utc_now(),
+        "experiments": [{"run_id": s.run_id, "branch": s.branch,
+                         "worktree": str(s.worktree)} for s in specs],
+    }
+    save_state(state)
+    for spec in specs:
+        spec.round_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(spec.round_dir / "hypothesis.json",
+                          spec.hypothesis.to_dict())
+
+    # Serial worktree creation: worktree add mutates shared .git admin state.
+    for spec in specs:
+        if ctx.git.branch_exists(spec.branch):
+            raise GitError(f"branch {spec.branch} already exists — "
+                           f"recovery did not run?")
+        ctx.git.worktree_add(spec.worktree, spec.branch, base_commit)
+
+    state["current_generation"]["phase"] = "executing"
+    save_state(state)
+
+    snapshot = state.get("best_primary")
+    results: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=len(specs)) as pool:
+        futures = {pool.submit(run_experiment, ctx, spec, snapshot): spec
+                   for spec in specs}
+        try:
+            for future in as_completed(futures):
+                spec = futures[future]
+                try:
+                    results[spec.run_id] = future.result()
+                except ProtectionViolation:
+                    raise  # tamper is never a per-branch condition
+                except EvaluatorInfraError as exc:
+                    # One flaky evaluation must not burn the generation.
+                    results[spec.run_id] = {
+                        "record_type": "experiment",
+                        "run_id": spec.run_id,
+                        "round": int(spec.run_id[1:]),
+                        "generation": generation,
+                        "timestamp_utc": utc_now(),
+                        "hypothesis": spec.hypothesis.to_dict(),
+                        "executor": spec.hypothesis.executor,
+                        "branch": spec.branch,
+                        "base_commit": base_commit,
+                        "commit": None,
+                        "verdict": "aborted",
+                        "failure_class": f"evaluator_infra: {exc}",
+                        "decision": "reject",
+                        "primary": None,
+                        "best_primary_before": snapshot,
+                        "proposer": spec.hypothesis.proposer,
+                    }
+        except BaseException:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+
+    ordered = [results[s.run_id] for s in specs]
+    if getattr(ctx.proposer, "last_cost_usd", None) is not None:
+        # One batch call funded the whole generation; attribute to the first.
+        ordered[0]["proposal_cost_usd"] = ctx.proposer.last_cost_usd
+
+    state["current_generation"]["phase"] = "evaluated"
+    save_state(state)
+
+    gate_record, winner_run_id = _run_gate(ctx, state, ordered, generation,
+                                           base_commit)
+    state["current_generation"]["phase"] = "gated"
+    save_state(state)
+
+    return _finish_generation(ctx, state, specs, ordered, gate_record,
+                              winner_run_id)
 
 
 def read_insights() -> list[dict]:
@@ -1433,22 +2261,29 @@ def recover(ctx: LoopContext) -> None:
                 git.worktree_remove(child)
         git.worktree_prune()
 
-    current = state.get("current_round")
+    current = state.get("current_generation")
     if current:
-        run_id = current.get("run_id")
-        branch = current.get("branch")
+        generation = current.get("generation")
         base = current.get("base_commit")
-        print(f"[recover] round {run_id} was interrupted; marking aborted",
-              file=sys.stderr)
         ledger_ids = {r.get("run_id") for r in read_jsonl(LEDGER_PATH)}
-        if branch and git.branch_exists(branch):
-            if git.branch_tip(branch) == base:
+        for exp in current.get("experiments", []):
+            run_id = exp.get("run_id")
+            branch = exp.get("branch")
+            if branch and git.branch_exists(branch) \
+                    and git.branch_tip(branch) == base:
                 git.delete_branch(branch)  # no commit: nothing to preserve
-        if run_id not in ledger_ids:
+            if run_id in ledger_ids:
+                # A crash after the write-ahead batch: real records exist;
+                # never overwrite them with aborted ones.
+                continue
+            print(f"[recover] round {run_id} (generation {generation}) was "
+                  f"interrupted; marking aborted", file=sys.stderr)
             aborted_record = {
                 "record_type": "experiment",
                 "run_id": run_id,
-                "round": state.get("round"),
+                "round": int(str(run_id)[1:]) if str(run_id)[1:].isdigit()
+                else None,
+                "generation": generation,
                 "timestamp_utc": utc_now(),
                 "verdict": "aborted",
                 "failure_class": "interrupted",
@@ -1469,7 +2304,7 @@ def recover(ctx: LoopContext) -> None:
             except (OSError, json.JSONDecodeError):
                 pass
             append_jsonl(LEDGER_PATH, aborted_record)
-        state["current_round"] = None
+        state["current_generation"] = None
 
     # Replay accepted-but-unmerged rounds (ledger verdict is the write-ahead log).
     records = read_jsonl(LEDGER_PATH)
@@ -1528,6 +2363,7 @@ def _load_evaluator_declarations() -> dict:
         "budgets": dict(module.TRAIN_TIMEOUT_S),
         "metric_name": module.PRIMARY_METRIC_NAME,
         "metric_direction": module.PRIMARY_METRIC_DIRECTION,
+        "split_names": tuple(module.SPLIT_NAMES),
     }
 
 
@@ -1565,31 +2401,48 @@ def cmd_init(args: argparse.Namespace) -> int:
             f"but evaluator hardcodes "
             f"{declared['metric_name']}/{declared['metric_direction']}"
         )
+    if declared["split_names"] != ("dev", "gate", "test"):
+        raise ContractError(
+            f"split drift: this orchestrator expects dev/gate/test but the "
+            f"evaluator declares {declared['split_names']}"
+        )
 
     if not git.is_repo():
         git.init_repo()
         print("[init] git repository created (branch: main)")
+    # A background `gc --auto` (spawned by merges) could rewrite packed-refs
+    # while parallel worktree operations run; disable it outright.
+    git.run("config", "gc.auto", "0")
 
     if args.force and EXPERIMENTS_DIR.exists():
         shutil.rmtree(EXPERIMENTS_DIR)
         print("[init] --force: cleared experiments/")
 
     if not HELDOUT_CONFIG_PATH.exists() or args.force:
-        seed = int.from_bytes(os.urandom(8), "big") % (2**31 - 1)
+        seeds = set()
+        while len(seeds) < 3:  # pairwise-distinct hidden seeds
+            seeds.add(int.from_bytes(os.urandom(8), "big") % (2**31 - 1))
+        dev_seed, gate_seed, test_seed = sorted(seeds)
         atomic_write_json(HELDOUT_CONFIG_PATH, {
-            "seed": seed,
-            "size": 400,
+            "schema_version": 2,
+            "splits": {
+                "dev": {"seed": dev_seed},
+                "gate": {"seed": gate_seed},
+                "test": {"seed": test_seed},
+            },
             "created_utc": utc_now(),
-            "note": "hidden held-out seed; untracked by git on purpose",
+            "note": "hidden held-out seeds (dev=search, gate=blind admission, "
+                    "test=final report); untracked by git on purpose",
         })
-        print("[init] generated evaluation/heldout_config.json (hidden seed)")
+        print("[init] generated evaluation/heldout_config.json "
+              "(hidden dev/gate/test seeds)")
 
     guard.write_manifest()
     print(f"[init] protection manifest written "
           f"({len(guard.load_manifest()['files'])} files)")
 
     if not git.has_head():
-        git.commit_all("AutoResearch Phase 1 scaffold\n\n"
+        git.commit_all("AutoResearch scaffold\n\n"
                        "Contract, evaluator, dataset, trainer, orchestrator, "
                        "protection manifest.")
         print(f"[init] initial commit {git.head()[:12]}")
@@ -1620,13 +2473,15 @@ def cmd_init(args: argparse.Namespace) -> int:
         "campaign_id": datetime.now(timezone.utc).strftime("c%Y%m%d%H%M%S"),
         "created_utc": utc_now(),
         "round": 0,
+        "generation": 0,
         "baseline_primary": value,
         "best_primary": value,
         "best_commit": git.head(),
         "stagnation": 0,
         "tested": {},
         "last_accepted": None,
-        "current_round": None,
+        "gate": {"incumbent_scores": {}},
+        "current_generation": None,
     })
     append_jsonl(LEDGER_PATH, {
         "record_type": "baseline",
@@ -1639,20 +2494,30 @@ def cmd_init(args: argparse.Namespace) -> int:
     rebuild_insights()
 
     pm = contract.primary_metric
-    print(f"[init] baseline {pm.name} = {value:.6f} at {git.head()[:12]}")
+    print(f"[init] baseline {pm.name} (dev) = {value:.6f} at {git.head()[:12]}")
     print("[init] protected files set read-only; ready: "
-          "`uv run python orchestrator.py run --rounds N`")
+          "`uv run python orchestrator.py run --generations N`")
     return 0
 
 
-def build_proposer(args: argparse.Namespace):
+def build_context(args: argparse.Namespace, contract: ResearchContract,
+                  git: Git, guard: ProtectionGuard) -> LoopContext:
     heuristic = HeuristicProposer()
     if args.proposer == "claude":
-        return FallbackProposer(
+        proposer: Any = FallbackProposer(
             ClaudeProposer(model=args.model, max_budget_usd=args.max_budget_usd),
             heuristic,
         )
-    return heuristic
+    else:
+        proposer = heuristic
+    coder = None
+    if contract.portfolio.max_coder_hypotheses > 0 and args.proposer == "claude":
+        # Coder hypotheses only arise from the LLM proposer; heuristic runs
+        # stay fully offline and deterministic.
+        coder = ClaudeCoder(contract, model=args.model)
+    return LoopContext(contract=contract, git=git, guard=guard,
+                       patcher=HyperparamsPatcher(), proposer=proposer,
+                       coder=coder)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -1662,55 +2527,78 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not git.is_repo() or not git.has_head():
         raise OrchestratorError("not initialized — run `orchestrator.py init` first")
 
-    ctx = LoopContext(contract=contract, git=git, guard=guard,
-                      patcher=HyperparamsPatcher(), proposer=build_proposer(args))
+    ctx = build_context(args, contract, git, guard)
     recover(ctx)
 
     dirty = git.status_paths(include_untracked=False)
     if dirty:
         raise OrchestratorError(
             f"main working tree has uncommitted tracked changes {dirty}; "
-            "commit or restore them first — rounds branch from HEAD, so a "
-            "dirty tree desynchronizes proposals from what actually runs"
+            "commit or restore them first — generations branch from HEAD, so "
+            "a dirty tree desynchronizes proposals from what actually runs"
         )
 
     pm = contract.primary_metric
+    pf = contract.portfolio
     executed = 0
     stop_reason = None
-    while executed < args.rounds:
+    while executed < args.generations:
         state = load_state()
         if state["round"] >= contract.budgets.max_rounds:
             stop_reason = "max_rounds"
             break
-        if state["stagnation"] >= contract.stop_conditions.stagnation_rounds:
+        if (pf.max_generations is not None
+                and state.get("generation", 0) >= pf.max_generations):
+            stop_reason = "max_generations"
+            break
+        if state["stagnation"] >= contract.stop_conditions.stagnation_generations:
             stop_reason = "stagnation"
             break
-        record = run_round(ctx, state)
-        if record is None:
+        result = run_generation(ctx, state)
+        if result is None:
             stop_reason = "search_space_exhausted"
             break
+        if "stop" in result:
+            stop_reason = result["stop"]
+            break
         executed += 1
-        primary = record.get("primary")
-        primary_txt = f"{primary:.4f}" if isinstance(primary, float) else "n/a"
-        intervention = record["hypothesis"]["intervention"]
-        print(f"[{record['run_id']}] {intervention['param']}: "
-              f"{intervention['from']!r} -> {intervention['to']!r}  "
-              f"{pm.name}={primary_txt}  verdict={record['verdict']}"
-              f"{' (' + str(record['failure_class']) + ')' if record['failure_class'] else ''}"
-              f"  decision={record['decision'].upper()}")
+        gate = result["gate"]
+        print(f"— generation g{gate['generation']:04d} —")
+        for record in result["records"]:
+            iv = (record.get("hypothesis") or {}).get("intervention") or {}
+            primary = record.get("primary")
+            primary_txt = f"{primary:.4f}" if isinstance(primary, float) else "n/a"
+            if record.get("executor") == "coder":
+                what = "coder"
+            else:
+                what = f"{iv.get('param')}: {iv.get('from')!r} -> {iv.get('to')!r}"
+            failure = record.get("failure_class")
+            print(f"  [{record['run_id']}] {what}  {pm.name}={primary_txt}  "
+                  f"verdict={record['verdict']}"
+                  f"{' (' + str(failure) + ')' if failure else ''}  "
+                  f"decision={record['decision'].upper()}")
+        # Gate outcome for humans: PASS/FAIL bits only — gate scores never
+        # reach the console (transcripts get pasted into LLM contexts).
+        if gate["candidates"]:
+            outcome = (f"winner {result['winner']}" if result["winner"]
+                       else "no candidate admitted")
+            print(f"  [gate] candidates {gate['candidates']} -> {outcome}")
+        else:
+            print("  [gate] no dev improvers; gate skipped")
 
     state = load_state()
     best = state.get("best_primary")
     baseline = state.get("baseline_primary")
-    print(f"\nrounds executed: {executed} (total {state['round']}); "
-          f"stop: {stop_reason or 'requested rounds done'}")
+    print(f"\ngenerations executed: {executed} (total {state.get('generation', 0)}; "
+          f"experiments {state['round']}); "
+          f"stop: {stop_reason or 'requested generations done'}")
     if isinstance(best, float) and isinstance(baseline, float):
-        print(f"{pm.name}: baseline {baseline:.6f} -> best {best:.6f} "
+        print(f"{pm.name} (dev): baseline {baseline:.6f} -> best {best:.6f} "
               f"({(baseline - best) / baseline:+.2%} relative)"
               if pm.direction == "minimize" else
-              f"{pm.name}: baseline {baseline:.6f} -> best {best:.6f}")
+              f"{pm.name} (dev): baseline {baseline:.6f} -> best {best:.6f}")
     print(f"incumbent commit: {state.get('best_commit', '?')[:12]}  "
-          f"stagnation: {state.get('stagnation')}")
+          f"stagnation: {state.get('stagnation')} generations")
     return 0
 
 
@@ -1721,31 +2609,141 @@ def cmd_status(_: argparse.Namespace) -> int:
     print(f"contract:   {contract.contract_id}")
     print(f"objective:  {contract.objective[:100]}")
     print(f"metric:     {pm.name} ({pm.direction}, "
-          f"min rel improvement {pm.min_relative_improvement:.1%})")
-    print(f"round:      {state['round']} / {contract.budgets.max_rounds}")
+          f"min rel improvement {pm.min_relative_improvement:.1%}; "
+          f"gate epsilon {contract.portfolio.gate_min_relative_improvement:.2%})")
+    print(f"experiments: {state['round']} / {contract.budgets.max_rounds}  "
+          f"generations: {state.get('generation', 0)}")
     baseline = state.get("baseline_primary")
     best = state.get("best_primary")
     if isinstance(baseline, float) and isinstance(best, float):
-        print(f"baseline:   {baseline:.6f}")
-        print(f"best:       {best:.6f} at {state.get('best_commit', '?')[:12]}")
+        print(f"baseline:   {baseline:.6f} (dev)")
+        print(f"best:       {best:.6f} (dev) at {state.get('best_commit', '?')[:12]}")
     print(f"stagnation: {state.get('stagnation')} / "
-          f"{contract.stop_conditions.stagnation_rounds}")
-    records = [r for r in read_jsonl(LEDGER_PATH)
-               if r.get("record_type") == "experiment"]
-    if records:
-        print(f"\nlast {min(10, len(records))} experiments:")
-        for r in records[-10:]:
+          f"{contract.stop_conditions.stagnation_generations} generations")
+    records = read_jsonl(LEDGER_PATH)
+    experiments = [r for r in records if r.get("record_type") == "experiment"]
+    if experiments:
+        print(f"\nlast {min(12, len(experiments))} experiments:")
+        for r in experiments[-12:]:
             hyp = r.get("hypothesis") or {}
             iv = hyp.get("intervention") or {}
             primary = r.get("primary")
             primary_txt = f"{primary:.4f}" if isinstance(primary, float) else "n/a"
-            if iv.get("param") is None:
-                print(f"  {r.get('run_id')}: (interrupted before patch)  "
-                      f"{r.get('verdict')}  {r.get('decision')}")
+            gen = r.get("generation")
+            gen_txt = f"g{gen:04d} " if isinstance(gen, int) else ""
+            if r.get("executor") == "coder":
+                what = f"coder ({(hyp.get('statement') or '')[:40]})"
+            elif iv.get("param") is None:
+                print(f"  {gen_txt}{r.get('run_id')}: (interrupted before "
+                      f"patch)  {r.get('verdict')}  {r.get('decision')}")
                 continue
-            print(f"  {r.get('run_id')}: {iv.get('param')} "
-                  f"{iv.get('from')!r}->{iv.get('to')!r}  {primary_txt}  "
+            else:
+                what = f"{iv.get('param')} {iv.get('from')!r}->{iv.get('to')!r}"
+            print(f"  {gen_txt}{r.get('run_id')}: {what}  {primary_txt}  "
                   f"{r.get('verdict')}  {r.get('decision')}")
+    gates = [r for r in records if r.get("record_type") == "gate"]
+    if gates:
+        print(f"\nlast {min(5, len(gates))} gate decisions (scores withheld):")
+        for g in gates[-5:]:
+            print(f"  g{g.get('generation', 0):04d}: candidates "
+                  f"{g.get('candidates')} -> "
+                  f"{g.get('winner') or 'no winner'}")
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    """One-shot final report on the untouched test split.
+
+    The test split is single-use by contract; a second run requires --force
+    and is disclosed in test_evaluations. Nothing here feeds back into
+    state, insights, or proposals.
+    """
+    contract = load_contract()
+    git = Git(ROOT)
+    guard = ProtectionGuard(ROOT, contract)
+    state = load_state()
+    pm = contract.primary_metric
+
+    records = read_jsonl(LEDGER_PATH)
+    prior_reports = [r for r in records if r.get("record_type") == "final_report"]
+    if prior_reports and not args.force:
+        raise OrchestratorError(
+            f"{len(prior_reports)} final report(s) already exist — the test "
+            f"split is single-use. Re-run with --force only if you accept "
+            f"the multiple-testing disclosure."
+        )
+    baseline_rec = next((r for r in records
+                         if r.get("record_type") == "baseline"), None)
+    if baseline_rec is None:
+        raise OrchestratorError("no baseline record in the ledger")
+
+    report_dir = EXPERIMENTS_DIR / "report"
+
+    def test_eval(name: str, commit: str) -> float | None:
+        if git.head() == commit and not git.status_paths(include_untracked=False):
+            workspace, cleanup = ROOT, False
+        else:
+            workspace = WORKTREES_DIR / f"report-{name}"
+            git.worktree_remove(workspace)
+            git.worktree_add_detached(workspace, commit)
+            cleanup = True
+        try:
+            metrics = run_evaluator(guard, workspace, "dev",
+                                    report_dir / f"{name}_test.json",
+                                    f"report-{name}",
+                                    contract.budgets.dev_train_timeout_s,
+                                    split="test")
+        finally:
+            if cleanup:
+                git.worktree_remove(workspace)
+        return (metrics.get("primary_metric") or {}).get("value")
+
+    baseline_test = test_eval("baseline", baseline_rec["commit"])
+    incumbent_test = test_eval("incumbent", state["best_commit"])
+
+    experiments = [r for r in records if r.get("record_type") == "experiment"]
+    gates = [r for r in records if r.get("record_type") == "gate"]
+    gate_eval_count = (
+        sum(len(g.get("results") or {}) for g in gates)
+        + sum(1 for g in gates if g.get("incumbent_evaluated"))
+    )
+
+    relative = None
+    if isinstance(baseline_test, float) and isinstance(incumbent_test, float):
+        relative = ((baseline_test - incumbent_test) / abs(baseline_test)
+                    if pm.direction == "minimize"
+                    else (incumbent_test - baseline_test) / abs(baseline_test))
+
+    report = {
+        "record_type": "final_report",
+        "timestamp_utc": utc_now(),
+        "campaign_id": state.get("campaign_id"),
+        "contract_id": contract.contract_id,
+        "contract_sha256": sha256_file(CONTRACT_PATH),
+        "evaluator_sha256": sha256_file(EVALUATOR_PATH),
+        "baseline_commit": baseline_rec["commit"],
+        "incumbent_commit": state.get("best_commit"),
+        "test": {"baseline": baseline_test, "incumbent": incumbent_test,
+                 "relative_improvement": relative},
+        "dev": {"baseline": state.get("baseline_primary"),
+                "incumbent": state.get("best_primary")},
+        "multiple_testing_disclosure": {
+            "experiments": len(experiments),
+            "gate_evaluations": gate_eval_count,
+            "test_evaluations": len(prior_reports) + 1,
+            "generations": state.get("generation", 0),
+            "accepted": sum(1 for r in experiments
+                            if r.get("decision") == "accept"),
+            "note": "the incumbent's cached gate score was itself "
+                    "gate-selected, so the admission bar errs conservative",
+        },
+        "selection_rule": gates[-1].get("selection_rule") if gates else None,
+        "stop_state": {"stagnation": state.get("stagnation"),
+                       "round": state.get("round")},
+    }
+    append_jsonl(LEDGER_PATH, report)
+    atomic_write_json(report_dir / "report.json", report)
+    print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
 
@@ -1772,12 +2770,12 @@ def main() -> int:
                              "held-out seed and manifest")
     p_init.set_defaults(fn=cmd_init)
 
-    p_run = sub.add_parser("run", help="execute keep/reject rounds")
-    p_run.add_argument("--rounds", type=int, default=8)
+    p_run = sub.add_parser("run", help="execute portfolio generations")
+    p_run.add_argument("--generations", type=int, default=3)
     p_run.add_argument("--proposer", choices=("heuristic", "claude"),
                        default="heuristic")
     p_run.add_argument("--model", default=None,
-                       help="model override for the claude proposer")
+                       help="model override for the claude proposer/coder")
     p_run.add_argument("--max-budget-usd", type=float, default=0.5,
                        help="per-proposal budget cap for the claude proposer")
     p_run.set_defaults(fn=cmd_run)
@@ -1785,13 +2783,20 @@ def main() -> int:
     p_status = sub.add_parser("status", help="show campaign state")
     p_status.set_defaults(fn=cmd_status)
 
+    p_report = sub.add_parser("report",
+                              help="one-shot final report on the test split")
+    p_report.add_argument("--force", action="store_true",
+                          help="re-run despite an existing report (counted "
+                               "in the multiple-testing disclosure)")
+    p_report.set_defaults(fn=cmd_report)
+
     p_verify = sub.add_parser("verify-protection",
                               help="check protected files against the manifest")
     p_verify.set_defaults(fn=cmd_verify_protection)
 
     args = parser.parse_args()
     try:
-        if args.command in ("init", "run"):
+        if args.command in ("init", "run", "report"):
             with InstanceLock(LOCK_PATH):
                 return args.fn(args)
         return args.fn(args)
