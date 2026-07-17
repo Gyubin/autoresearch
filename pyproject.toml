@@ -1,0 +1,8 @@
+[project]
+name = "autoresearch"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "claude-agent-sdk>=0.2.120",
+    "pyyaml>=6.0.3",
+]

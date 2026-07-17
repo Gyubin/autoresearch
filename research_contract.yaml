@@ -1,0 +1,57 @@
+# =============================================================================
+# Research Contract (Layer 1) — PROTECTED FILE
+#
+# This contract is immutable during autoresearch runs:
+#   * It is listed in its own protected_globs, hashed into protection/hashes.json
+#     at init, and verified every round.
+#   * The orchestrator only ever READS it. Baseline results are recorded in
+#     experiments/state.json, never written back here.
+#
+# To intentionally change the contract: stop all runs, `chmod u+w` the file,
+# edit, then re-run `orchestrator.py init --force` to rebuild the manifest.
+# =============================================================================
+schema_version: 1
+contract_id: autoresearch-phase1-sgd-tuning
+
+objective: >
+  Minimize held-out RMSE of the synthetic-regression model trained by
+  src/train.py, by changing training hyperparameters only. The evaluator,
+  dataset definition, this contract, and the orchestrator are immutable
+  during runs.
+
+primary_metric:
+  name: heldout_rmse
+  direction: minimize
+  # Relative epsilon keep-rule: accept a candidate only if it improves the
+  # incumbent by at least this fraction. Evaluation is deterministic, so a
+  # plain ">" rule would happily accept 1e-9 wiggles.
+  min_relative_improvement: 0.002
+
+secondary_metrics:
+  - train_rmse
+  - generalization_gap
+  - train_seconds
+
+editable_globs:
+  - "src/**"
+
+protected_globs:
+  - "evaluation/**"
+  - "research_contract.yaml"
+  - "orchestrator.py"
+  - "protection/**"
+  - "pyproject.toml"
+  - "uv.lock"
+  - ".python-version"
+
+budgets:
+  # Must match the hardcoded values in evaluation/evaluate.py; the evaluator
+  # never parses this file (it trusts nothing outside evaluation/), and
+  # `orchestrator.py init` cross-checks the two once, failing fast on drift.
+  smoke_train_timeout_s: 20
+  dev_train_timeout_s: 90
+  max_rounds: 40
+  repair_attempts: 2
+
+stop_conditions:
+  stagnation_rounds: 6
