@@ -65,7 +65,7 @@ import yaml
 # stdlib at import time (its LLM path lazy-imports the SDK), no orchestrator
 # import on its side, and it never reads experiments/ or state.
 from literature.engine import (ANTI_INJECTION_SENTENCE, CorpusError,
-                               build_engine, load_corpus)
+                               build_engine, load_corpus, move_of)
 
 # ---------------------------------------------------------------------------
 # Paths and constants
@@ -262,6 +262,15 @@ class StopConditions:
 
 
 @dataclass(frozen=True)
+class Halving:
+    """Successive-halving knobs (Phase 4b). Survivors of the smoke rung =
+    max(min_keep, ceil(parallel_branches * keep_fraction))."""
+    enabled: bool
+    keep_fraction: float
+    min_keep: int
+
+
+@dataclass(frozen=True)
 class Portfolio:
     parallel_branches: int
     gate_top_k: int
@@ -270,6 +279,30 @@ class Portfolio:
     max_generations: int | None
     coder_max_turns: int
     coder_max_budget_usd: float
+    halving: Halving
+
+
+@dataclass(frozen=True)
+class Refinement:
+    """Phase 4a: Gome-style search momentum + evidence-based move steering.
+    enabled=false restores the exact Phase 3 proposal behaviour."""
+    enabled: bool
+    momentum_decay: float
+    exploit_fraction: float
+    accelerate_after: int
+    evidence_steering: bool
+
+
+@dataclass(frozen=True)
+class PairwiseGate:
+    """Phase 4c: SciNav-style pairwise SELECTION among scalar-admitted gate
+    candidates. Admission itself always stays the deterministic gate-split
+    epsilon rule; judges never see gate scores."""
+    enabled: bool
+    judges: int
+    judge_model: str | None
+    judge_max_budget_usd: float
+    judge_max_campaign_budget_usd: float | None
 
 
 @dataclass(frozen=True)
@@ -299,6 +332,8 @@ class ResearchContract:
     portfolio: Portfolio
     stop_conditions: StopConditions
     literature: Literature
+    refinement: Refinement
+    pairwise_gate: PairwiseGate
 
 
 def _require(mapping: dict, key: str, kind: type | tuple, ctx: str) -> Any:
@@ -330,9 +365,22 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         raise ContractError("contract root must be a mapping")
 
     schema_version = _require(raw, "schema_version", int, "")
-    if schema_version != 3:
+    if schema_version != 4:
         raise ContractError(f"unsupported contract schema_version {schema_version} "
-                            f"(this orchestrator expects 3)")
+                            f"(this orchestrator expects 4)")
+
+    # Top-level whitelist (new in v4): an unknown block would previously be
+    # ignored silently, so a typo like `refinment:` could disable a whole
+    # subsystem without any error. The contract is a single controlled file;
+    # unrecognized keys are always a mistake.
+    known_keys = {"schema_version", "contract_id", "objective",
+                  "primary_metric", "secondary_metrics", "editable_globs",
+                  "protected_globs", "budgets", "portfolio",
+                  "stop_conditions", "literature", "refinement",
+                  "pairwise_gate"}
+    unknown = sorted(set(raw) - known_keys)
+    if unknown:
+        raise ContractError(f"contract: unknown top-level keys {unknown}")
 
     pm_raw = _require(raw, "primary_metric", dict, "")
     direction = _require(pm_raw, "direction", str, "primary_metric")
@@ -369,6 +417,13 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         or max_generations <= 0
     ):
         raise ContractError("portfolio.max_generations must be a positive int or null")
+    halving_raw = _require(pf_raw, "halving", dict, "portfolio")
+    halving = Halving(
+        enabled=_require(halving_raw, "enabled", bool, "portfolio.halving"),
+        keep_fraction=float(_require(halving_raw, "keep_fraction",
+                                     (int, float), "portfolio.halving")),
+        min_keep=_require(halving_raw, "min_keep", int, "portfolio.halving"),
+    )
     portfolio = Portfolio(
         parallel_branches=_require(pf_raw, "parallel_branches", int, "portfolio"),
         gate_top_k=_require(pf_raw, "gate_top_k", int, "portfolio"),
@@ -381,6 +436,7 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         coder_max_budget_usd=float(
             _require(pf_raw, "coder_max_budget_usd", (int, float), "portfolio")
         ),
+        halving=halving,
     )
     if not 1 <= portfolio.gate_top_k <= portfolio.parallel_branches <= 8:
         raise ContractError(
@@ -394,6 +450,66 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         raise ContractError(
             "portfolio.gate_min_relative_improvement must be in [0, 1)"
         )
+    if not 0.0 < halving.keep_fraction <= 1.0:
+        raise ContractError("portfolio.halving.keep_fraction must be in (0, 1]")
+    if not 1 <= halving.min_keep <= portfolio.parallel_branches:
+        raise ContractError(
+            "portfolio.halving.min_keep must be within [1, parallel_branches]")
+    if halving.enabled and portfolio.gate_top_k > halving.min_keep:
+        # The gate can only rank dev-evaluated survivors; a top_k above the
+        # guaranteed survivor floor would be unrepresentable.
+        raise ContractError(
+            "portfolio.gate_top_k cannot exceed halving.min_keep when "
+            "halving is enabled")
+
+    ref_raw = _require(raw, "refinement", dict, "")
+    refinement = Refinement(
+        enabled=_require(ref_raw, "enabled", bool, "refinement"),
+        momentum_decay=float(_require(ref_raw, "momentum_decay",
+                                      (int, float), "refinement")),
+        exploit_fraction=float(_require(ref_raw, "exploit_fraction",
+                                        (int, float), "refinement")),
+        accelerate_after=_require(ref_raw, "accelerate_after", int,
+                                  "refinement"),
+        evidence_steering=_require(ref_raw, "evidence_steering", bool,
+                                   "refinement"),
+    )
+    if not 0.0 < refinement.momentum_decay < 1.0:
+        raise ContractError("refinement.momentum_decay must be in (0, 1)")
+    if not 0.5 <= refinement.exploit_fraction <= 0.9:
+        raise ContractError("refinement.exploit_fraction must be in [0.5, 0.9]")
+    if refinement.accelerate_after < 1:
+        raise ContractError("refinement.accelerate_after must be >= 1")
+
+    pw_raw = _require(raw, "pairwise_gate", dict, "")
+    judge_model = pw_raw.get("judge_model")
+    if judge_model is not None and (
+            not isinstance(judge_model, str) or not judge_model.strip()):
+        raise ContractError(
+            "pairwise_gate.judge_model must be a non-empty string or null")
+    judge_campaign_cap = pw_raw.get("judge_max_campaign_budget_usd")
+    if judge_campaign_cap is not None and (
+        isinstance(judge_campaign_cap, bool)
+        or not isinstance(judge_campaign_cap, (int, float))
+        or judge_campaign_cap <= 0
+    ):
+        raise ContractError(
+            "pairwise_gate.judge_max_campaign_budget_usd must be a positive "
+            "number or null")
+    pairwise_gate = PairwiseGate(
+        enabled=_require(pw_raw, "enabled", bool, "pairwise_gate"),
+        judges=_require(pw_raw, "judges", int, "pairwise_gate"),
+        judge_model=judge_model,
+        judge_max_budget_usd=float(_require(
+            pw_raw, "judge_max_budget_usd", (int, float), "pairwise_gate")),
+        judge_max_campaign_budget_usd=(
+            float(judge_campaign_cap) if judge_campaign_cap is not None
+            else None),
+    )
+    if not 1 <= pairwise_gate.judges <= 5 or pairwise_gate.judges % 2 == 0:
+        raise ContractError("pairwise_gate.judges must be an odd int in [1, 5]")
+    if pairwise_gate.judge_max_budget_usd <= 0:
+        raise ContractError("pairwise_gate.judge_max_budget_usd must be positive")
 
     lit_raw = _require(raw, "literature", dict, "")
     corpus_path = _require(lit_raw, "corpus_path", str, "literature")
@@ -452,6 +568,10 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         raise ContractError("literature.citation_hops must be in [0, 2]")
     if literature.llm_max_budget_usd <= 0:
         raise ContractError("literature.llm_max_budget_usd must be positive")
+    if refinement.evidence_steering and not literature.enabled:
+        raise ContractError(
+            "refinement.evidence_steering requires literature.enabled "
+            "(steering ranks move directions by literature stance)")
 
     return ResearchContract(
         schema_version=schema_version,
@@ -469,6 +589,8 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         portfolio=portfolio,
         stop_conditions=stop,
         literature=literature,
+        refinement=refinement,
+        pairwise_gate=pairwise_gate,
     )
 
 
@@ -826,6 +948,12 @@ class ProposalContext:
     # Phase 3: compact literature evidence records (proposer view). Data,
     # not instructions; empty when literature is disabled.
     evidence: list[dict] = field(default_factory=list)
+    # Phase 4: search momentum ("{param}:{move}" -> fold entry, derived ONLY
+    # from experiment records / dev values) and structured literature move
+    # guidance. Data, not instructions; empty when refinement is disabled.
+    momentum: dict = field(default_factory=dict)
+    move_guidance: list = field(default_factory=list)
+    refinement: Refinement | None = None
 
 
 _MECHANISMS = {
@@ -858,6 +986,25 @@ def _round_sig(x: float, digits: int = 6) -> float:
     return float(f"{x:.{digits}g}")
 
 
+# Phase 4 value-progression tables. Kinds map onto the existing _MECHANISMS
+# vocabulary so progression certificates carry the same mechanism text as
+# their standard-step siblings. Set-valued params (momentum/l2) have kinds
+# but no step factor: they can bisect toward a boundary, never accelerate.
+_MOVE_KINDS = {
+    ("lr", "increase"): "lr_up", ("lr", "decrease"): "lr_down",
+    ("epochs", "increase"): "epochs_up",
+    ("batch_size", "increase"): "batch_up",
+    ("batch_size", "decrease"): "batch_down",
+    ("momentum", "increase"): "momentum", ("momentum", "decrease"): "momentum",
+    ("l2", "increase"): "l2", ("l2", "decrease"): "l2",
+}
+_STEP_FACTORS = {
+    ("lr", "increase"): 2.5, ("lr", "decrease"): 1 / 2.5,
+    ("epochs", "increase"): 2.0,
+    ("batch_size", "increase"): 2.0, ("batch_size", "decrease"): 0.5,
+}
+
+
 class HeuristicProposer:
     """Deterministic rule-based proposer.
 
@@ -885,10 +1032,77 @@ class HeuristicProposer:
         moves.append(("batch_up", "batch_size", min(int(hp["batch_size"]) * 2, 256)))
         return moves
 
+    @staticmethod
+    def _clamped(param: str, value: float) -> Any:
+        """Apply the same per-param bounds `_moves` bakes into its steps."""
+        if param == "epochs":
+            return min(max(int(round(value)), 1), 400)
+        if param == "batch_size":
+            return min(max(int(round(value)), 4), 256)
+        return _round_sig(float(value))
+
+    def _progression_moves(self, ctx: ProposalContext) -> list[tuple[str, str, Any]]:
+        """Phase 4 value progression from search momentum:
+        (i) geometric bisection toward a recorded infeasibility boundary
+            (the endpoint that made training degenerate / time out), and
+        (ii) an accelerated (squared) step after `accelerate_after`
+            consecutive accepts in one direction — Gome's "learning rate"
+            as intervention magnitude; at most one per generation.
+        Every value passes the same bounds/tested filters as static moves.
+        """
+        ref = ctx.refinement
+        if ref is None or not ref.enabled or not ctx.momentum:
+            return []
+        hp = ctx.current_hyperparams
+        moves: list[tuple[str, str, Any]] = []
+        accelerated = False
+        for key in sorted(ctx.momentum, key=lambda k: -ctx.momentum[k]["score"]):
+            entry = ctx.momentum[key]
+            param, move = entry.get("param"), entry.get("move")
+            if param not in hp:
+                continue
+            current = hp[param]
+            if isinstance(current, bool) or not isinstance(current, (int, float)):
+                continue
+            kind = _MOVE_KINDS.get((param, move))
+            if kind is None:
+                continue
+            boundary = entry.get("boundary_to")
+            if (isinstance(boundary, (int, float))
+                    and not isinstance(boundary, bool)
+                    and boundary > 0 and current > 0):
+                mid = self._clamped(param, math.sqrt(float(current)
+                                                     * float(boundary)))
+                if mid != current and mid != boundary:
+                    moves.append((kind, param, mid))
+            if (not accelerated
+                    and entry.get("consecutive_accepts", 0)
+                    >= ref.accelerate_after):
+                factor = _STEP_FACTORS.get((param, move))
+                if factor is not None:
+                    val = self._clamped(param, float(current) * factor * factor)
+                    if val != current:
+                        moves.append((kind, param, val))
+                        accelerated = True
+        return moves
+
+    @staticmethod
+    def _guidance_map(ctx: ProposalContext) -> dict[tuple[str, str], str]:
+        if ctx.refinement is None or not ctx.refinement.evidence_steering:
+            return {}
+        return {(g.get("intervention"), g.get("move")): g.get("stance")
+                for g in ctx.move_guidance
+                if g.get("intervention") and g.get("move")}
+
     def _filtered_candidates(self, ctx: ProposalContext) -> list[tuple[str, str, Any]]:
         hp = ctx.current_hyperparams
+        ref = ctx.refinement
+        steering = ref is not None and ref.enabled
+        raw_moves = ((self._progression_moves(ctx) if steering else [])
+                     + self._moves(hp))
         candidates = []
-        for kind, param, new_value in self._moves(hp):
+        seen_values: set[tuple[str, str]] = set()
+        for kind, param, new_value in raw_moves:
             if new_value == hp[param]:
                 continue
             if isinstance(new_value, float) and (
@@ -897,16 +1111,43 @@ class HeuristicProposer:
                 continue
             if value_repr(new_value) in ctx.tested.get(param, []):
                 continue
+            dedup = (param, value_repr(new_value))
+            if dedup in seen_values:
+                continue  # a progression step can coincide with a static one
+            seen_values.add(dedup)
             candidates.append((kind, param, new_value))
 
-        last = ctx.last_accepted
-        if last:
-            for cand in candidates:
-                if cand[0] == last.get("kind"):
-                    candidates.remove(cand)
-                    candidates.insert(0, cand)
-                    break
-        return candidates
+        if not steering:
+            # Phase 3 behaviour, unchanged: static priority with the last
+            # accepted move kind retried first (the original 1-step
+            # "momentum of search").
+            last = ctx.last_accepted
+            if last:
+                for cand in candidates:
+                    if cand[0] == last.get("kind"):
+                        candidates.remove(cand)
+                        candidates.insert(0, cand)
+                        break
+            return candidates
+
+        # Phase 4 deterministic steering sort:
+        #   1. search momentum score (the campaign's own measured signal),
+        #   2. literature stance rank (supports < none/mixed < contradicts);
+        #      contradicted moves are demoted, NEVER removed — testing a
+        #      contradiction is legitimate science, and move-space
+        #      exhaustion semantics must not depend on the corpus,
+        #   3. original static priority as the stable tie-break.
+        guidance = self._guidance_map(ctx)
+
+        def rank(item: tuple[int, tuple[str, str, Any]]):
+            index, (_kind, param, new_value) = item
+            move = move_of(hp.get(param), new_value)
+            score = (ctx.momentum.get(f"{param}:{move}") or {}).get("score", 0.0)
+            ev_rank = {"supports": 0, "contradicts": 2}.get(
+                guidance.get((param, move)), 1)
+            return (-score, ev_rank, index)
+
+        return [cand for _, cand in sorted(enumerate(candidates), key=rank)]
 
     def _certificate(self, ctx: ProposalContext, round_index: int,
                      kind: str, param: str, new_value: Any) -> Hypothesis:
@@ -945,17 +1186,59 @@ class HeuristicProposer:
         )
 
     def propose_batch(self, ctx: ProposalContext, k: int) -> list[Hypothesis]:
-        """Top-k diverse moves: at most one hypothesis per parameter."""
+        """Top-k diverse moves: at most one hypothesis per parameter.
+
+        Phase 4 (refinement enabled, k >= 2): the last explore_slots picks
+        are reserved for unexplored directions — zero search momentum and no
+        literature support — so steering can never collapse the whole
+        portfolio onto one direction (Blueprint §7 "hypothesis collapse").
+        An empty explore pool falls back to the ordinary ranking; slots are
+        never left unfilled because of it.
+        """
+        candidates = self._filtered_candidates(ctx)
+        ref = ctx.refinement
+        steering = ref is not None and ref.enabled
+        explore_slots = 0
+        if steering and k >= 2:
+            explore_slots = min(
+                max(1, round(k * (1.0 - ref.exploit_fraction))), k - 1)
+
+        hp = ctx.current_hyperparams
+        guidance = self._guidance_map(ctx)
+        explore_ok: set[int] = set()
+        if explore_slots:
+            for i, (_kind, param, new_value) in enumerate(candidates):
+                move = move_of(hp.get(param), new_value)
+                if f"{param}:{move}" in ctx.momentum:
+                    continue
+                if guidance.get((param, move)) == "supports":
+                    continue
+                explore_ok.add(i)
+
         batch: list[Hypothesis] = []
         seen_params: set[str] = set()
-        for kind, param, new_value in self._filtered_candidates(ctx):
-            if param in seen_params:
-                continue
+
+        def take(index: int) -> None:
+            kind, param, new_value = candidates[index]
             batch.append(self._certificate(ctx, ctx.round_index + len(batch),
                                            kind, param, new_value))
             seen_params.add(param)
-            if len(batch) == k:
+
+        for i, (_kind, param, _v) in enumerate(candidates):
+            if len(batch) >= k - explore_slots:
                 break
+            if param not in seen_params:
+                take(i)
+        for i, (_kind, param, _v) in enumerate(candidates):
+            if len(batch) >= k:
+                break
+            if i in explore_ok and param not in seen_params:
+                take(i)
+        for i, (_kind, param, _v) in enumerate(candidates):
+            if len(batch) >= k:
+                break
+            if param not in seen_params:
+                take(i)
         return batch
 
 
@@ -1043,6 +1326,7 @@ class ClaudeProposer:
             *tested_lines,
             "Distilled insights from past rounds:",
             json.dumps(insights, indent=2) if insights else "  (none yet)",
+            *self._momentum_sections(ctx),
             *([
                 "Literature evidence for this generation. "
                 + ANTI_INJECTION_SENTENCE,
@@ -1076,6 +1360,55 @@ class ClaudeProposer:
             parts.append(f"Your previous batch had problems: {feedback}. "
                          f"Propose a corrected batch.")
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _momentum_sections(ctx: ProposalContext) -> list[str]:
+        """Phase 4 prompt sections: search momentum + structured literature
+        move guidance. Both are data-not-instructions surfaces built from
+        experiment records / corpus enums only — no gate values can exist
+        here by construction of their inputs."""
+        sections: list[str] = []
+        if ctx.momentum:
+            view = []
+            ranked = sorted(ctx.momentum.items(),
+                            key=lambda kv: -abs(kv[1].get("score", 0.0)))
+            for _key, e in ranked[:8]:
+                item = {"param": e.get("param"), "move": e.get("move"),
+                        "score": e.get("score"),
+                        "last_outcome": e.get("last_outcome")}
+                if e.get("boundary_to") is not None:
+                    item["infeasible_at"] = e["boundary_to"]
+                view.append(item)
+            sections += [
+                "Search momentum, derived ONLY from this campaign's own "
+                "dev-split experiment history (decayed accept/reject signal "
+                "per (param, direction); NOT literature):",
+                "```json\n" + json.dumps(view, indent=1) + "\n```",
+                "Exploit strong positive-momentum directions, but reserve "
+                "at least one hypothesis for exploration: a (param, "
+                "direction) with zero search momentum, or a coder "
+                "hypothesis on an unexplored mechanism.",
+            ]
+        if ctx.move_guidance:
+            sections += [
+                "Structured literature guidance per (intervention, "
+                "direction) — the same evidence pack as below, aggregated "
+                "to categorical stances:",
+                "```json\n" + json.dumps(ctx.move_guidance, indent=1)
+                + "\n```",
+            ]
+        return sections
+
+    def _has_unexplored(self, batch: list[Hypothesis],
+                        ctx: ProposalContext) -> bool:
+        for hyp in batch:
+            if hyp.executor == "coder":
+                return True
+            iv = hyp.intervention
+            move = move_of(iv.get("from"), iv.get("to"))
+            if f"{iv.get('param')}:{move}" not in ctx.momentum:
+                return True
+        return False
 
     def _query(self, prompt: str, schema: dict) -> dict:
         import asyncio
@@ -1196,8 +1529,15 @@ class ClaudeProposer:
                               [str(e["evidence_id"]) for e in ctx.evidence
                                if e.get("evidence_id")])
         feedback: str | None = None
+        kept_batch: list[Hypothesis] = []  # valid batch held across a soft retry
         for _ in range(2):  # one whole-batch retry with per-item feedback
-            raw = self._query(self._prompt(ctx, k, max_coder, feedback), schema)
+            try:
+                raw = self._query(self._prompt(ctx, k, max_coder, feedback),
+                                  schema)
+            except Exception:
+                if kept_batch:
+                    return kept_batch  # never lose a valid batch to a retry
+                raise
             items = raw.get("hypotheses")
             if not isinstance(items, list):
                 feedback = "missing hypotheses array"
@@ -1220,7 +1560,23 @@ class ClaudeProposer:
                     seen_params.add(validated.intervention["param"])
                 batch.append(validated)
             if batch:
+                if (ctx.refinement is not None and ctx.refinement.enabled
+                        and ctx.momentum and feedback is None
+                        and not self._has_unexplored(batch, ctx)):
+                    # Soft diversity check (one retry, then accept): a batch
+                    # where EVERY hypothesis follows an already-measured
+                    # direction is the Blueprint §7 collapse smell.
+                    kept_batch = batch
+                    feedback = (
+                        "every hypothesis follows a direction that already "
+                        "has search momentum; include at least one "
+                        "exploring a (param, direction) with zero search "
+                        "momentum or a coder hypothesis on an unexplored "
+                        "mechanism")
+                    continue
                 return batch
+            if kept_batch:
+                return kept_batch  # soft retry produced nothing valid
             feedback = "; ".join(errors) or "no valid items"
         raise ProposerError(f"Claude proposer produced no valid batch: {feedback}")
 
@@ -1760,6 +2116,133 @@ def replay_ledger_fields(state: dict, records: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 4a: search momentum (Gome-style directional update vectors)
+#
+# Both functions are pure folds over the ledger with the SAME input closure
+# as replay_ledger_fields: experiment records only (gate / correction /
+# evidence records are structurally excluded), corrected accepts are
+# neutralized, aborted runs carry no signal. Everything is derived from
+# proposer-visible fields (dev primary, verdict/decision bits, intervention
+# endpoints), so the gate-blindness invariant holds by construction. The
+# result is NEVER persisted in state — like insight_memory it is derived
+# data, recomputed from the ledger at each use site, which makes
+# replay == live trivially true and adds zero crash-recovery surface.
+# ---------------------------------------------------------------------------
+
+# Endpoints that made a validly-implemented run infeasible mark a boundary
+# for bisection (the failing value is remembered as `boundary_to`).
+_INFEASIBILITY_CLASSES = {"degenerate_weights", "no_skill", "timeout",
+                          "nonzero_exit"}
+
+
+def _momentum_weight(vector: dict) -> tuple[float, Any]:
+    """(weight, boundary_to) for one update vector. Code constants, like the
+    distill_insight confidences. Accept/reject bits are proposer-visible by
+    design (HANDOFF invariant 4); gate SCORES never appear in the input."""
+    verdict = vector.get("verdict")
+    if verdict == "valid_positive":
+        return (1.0, None) if vector.get("decision") == "accept" else (0.4, None)
+    if verdict == "valid_negative":
+        if vector.get("failure_class") in _INFEASIBILITY_CLASSES:
+            return -1.0, vector.get("to")
+        return -1.0, None  # metric regression / unexecuted run
+    if verdict == "valid_inconclusive":
+        return -0.2, None
+    # pruned (Phase 4b budget policy) / invalid_implementation /
+    # contract_violation / ff_conflict / nondeterministic: no science here.
+    return 0.0, None
+
+
+def extract_update_vectors(records: list[dict], *,
+                           direction: str = "minimize") -> list[dict]:
+    """Structured directional signals from completed experiments."""
+    corrected = corrected_run_ids(records)
+    vectors: list[dict] = []
+    for r in records:
+        if r.get("record_type") != "experiment" or r.get("verdict") == "aborted":
+            continue
+        hyp = r.get("hypothesis") or {}
+        intervention = hyp.get("intervention") or {}
+        param = intervention.get("param")
+        frm, to = intervention.get("from"), intervention.get("to")
+        decision = r.get("decision")
+        if r.get("run_id") in corrected and decision == "accept":
+            decision = "reject"  # accept that never landed: no momentum
+        before, primary = r.get("best_primary_before"), r.get("primary")
+        delta_rel = None
+        if (isinstance(before, (int, float)) and isinstance(primary, (int, float))
+                and before):
+            rel = (before - primary) / abs(before)
+            if direction == "maximize":
+                rel = -rel
+            delta_rel = round(rel, 6)  # positive == improvement, dev values only
+        vectors.append({
+            "generation": r.get("generation"),
+            "run_id": r.get("run_id"),
+            "param": param if param is not None else "coder",
+            "move": move_of(frm, to) if param is not None else None,
+            "from": frm,
+            "to": to,
+            "delta_rel": delta_rel,
+            "verdict": r.get("verdict"),
+            "failure_class": r.get("failure_class"),
+            "decision": decision,
+        })
+    return vectors
+
+
+def search_momentum_table(vectors: list[dict], *, decay: float) -> dict[str, dict]:
+    """Fold update vectors into per-("{param}:{move}") directional scores.
+
+    Generation-ordered (same grouping rule as replay_ledger_fields: legacy
+    records without a generation field are singleton groups): every existing
+    score decays geometrically at each generation boundary so stale
+    directions fade. Scores are rounded to 2 decimals for byte-stable
+    serialization; coder hypotheses fold under "coder:none" (no single-param
+    direction — family-level coder momentum is deferred to Phase 5)."""
+    groups: list[list[dict]] = []
+    group_index: dict[int, int] = {}
+    for v in vectors:
+        gen = v.get("generation")
+        if isinstance(gen, int):
+            if gen not in group_index:
+                group_index[gen] = len(groups)
+                groups.append([])
+            groups[group_index[gen]].append(v)
+        else:
+            groups.append([v])
+
+    table: dict[str, dict] = {}
+    for group in groups:
+        for entry in table.values():
+            entry["score"] = round(entry["score"] * decay, 2)
+        for v in group:
+            weight, boundary = _momentum_weight(v)
+            if weight == 0.0 and boundary is None:
+                continue
+            key = f"{v['param']}:{v['move'] or 'none'}"
+            entry = table.setdefault(key, {
+                "param": v["param"], "move": v["move"], "score": 0.0,
+                "last_outcome": None, "last_generation": None,
+                "boundary_to": None, "consecutive_accepts": 0,
+                "evidence_run_ids": [],
+            })
+            entry["score"] = round(entry["score"] + weight, 2)
+            entry["last_outcome"] = ("accepted" if v["decision"] == "accept"
+                                     else v["verdict"])
+            entry["last_generation"] = v["generation"]
+            entry["consecutive_accepts"] = (
+                entry["consecutive_accepts"] + 1
+                if v["decision"] == "accept" else 0)
+            if boundary is not None:
+                entry["boundary_to"] = boundary
+            entry["evidence_run_ids"] = (
+                entry["evidence_run_ids"] + [v["run_id"]])[-5:]
+    return {k: v for k, v in sorted(table.items())
+            if abs(v["score"]) >= 0.01 or v["boundary_to"] is not None}
+
+
+# ---------------------------------------------------------------------------
 # Generation execution (parallel hypothesis portfolio)
 # ---------------------------------------------------------------------------
 
@@ -2263,6 +2746,18 @@ def run_generation(ctx: LoopContext, state: dict) -> dict | None:
     generation = state.get("generation", 0) + 1
     insights = read_insights()
     current_hyperparams = ctx.patcher.read(ROOT / TRAIN_REL)
+    # Phase 4a: search momentum — a pure fold over the ledger (experiment
+    # records only, same input closure as replay_ledger_fields, so gate
+    # scores cannot enter by construction). Derived data like insight_memory:
+    # recomputed here every generation, never persisted in state.
+    update_vectors: list[dict] = []
+    momentum: dict[str, dict] = {}
+    if contract.refinement.enabled:
+        update_vectors = extract_update_vectors(
+            read_jsonl(LEDGER_PATH),
+            direction=contract.primary_metric.direction)
+        momentum = search_momentum_table(
+            update_vectors, decay=contract.refinement.momentum_decay)
     grounding = None
     if ctx.literature is not None:
         # Literature grounding: main thread, pre-proposal, pre-gate. The
@@ -2275,6 +2770,10 @@ def run_generation(ctx: LoopContext, state: dict) -> dict | None:
             best_primary_dev=state.get("best_primary"),
             tested=state.get("tested", {}),
         )
+    move_guidance: list[dict] = []
+    if (grounding is not None and contract.refinement.enabled
+            and contract.refinement.evidence_steering):
+        move_guidance = grounding.move_guidance()
     batch = ctx.proposer.propose_batch(ProposalContext(
         contract=contract,
         round_index=state["round"] + 1,
@@ -2284,6 +2783,9 @@ def run_generation(ctx: LoopContext, state: dict) -> dict | None:
         last_accepted=state.get("last_accepted"),
         insights=insights,
         evidence=grounding.proposer_view() if grounding is not None else [],
+        momentum=momentum,
+        move_guidance=move_guidance,
+        refinement=contract.refinement,
     ), k_budget)
     if not batch:
         return None
@@ -2332,6 +2834,27 @@ def run_generation(ctx: LoopContext, state: dict) -> dict | None:
         spec.round_dir.mkdir(parents=True, exist_ok=True)
         atomic_write_json(spec.round_dir / "hypothesis.json",
                           spec.hypothesis.to_dict())
+    if contract.refinement.enabled:
+        # Pure audit artifact (Phase 4a): nothing ever reads this back, so
+        # it adds no recovery surface. Written pre-gate, like evidence.json,
+        # so gate scores cannot appear here even in principle.
+        gen_dir = EXPERIMENTS_DIR / "generations" / f"g{generation:04d}"
+        gen_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(gen_dir / "steering.json", {
+            "kind": "steering_snapshot",
+            "generation": generation,
+            "timestamp_utc": utc_now(),
+            "update_vectors": update_vectors[-24:],
+            "search_momentum": momentum,
+            "move_guidance": move_guidance,
+            "batch": [{
+                "hypothesis_id": h.id,
+                "param": h.intervention.get("param"),
+                "move": move_of(h.intervention.get("from"),
+                                h.intervention.get("to")),
+                "executor": h.executor,
+            } for h in batch],
+        })
     if grounding is not None:
         # Evidence memory — separate from the ledger by design. The
         # per-generation snapshot is an idempotent overwrite (a fully
@@ -2896,6 +3419,19 @@ def cmd_status(_: argparse.Namespace) -> int:
             print(f"  g{g.get('generation', 0):04d}: candidates "
                   f"{g.get('candidates')} -> "
                   f"{g.get('winner') or 'no winner'}")
+    if contract.refinement.enabled:
+        momentum = search_momentum_table(
+            extract_update_vectors(records, direction=pm.direction),
+            decay=contract.refinement.momentum_decay)
+        if momentum:
+            top = sorted(momentum.items(),
+                         key=lambda kv: -abs(kv[1]["score"]))[:6]
+            print("\nsearch momentum (ledger-derived, dev signals only):")
+            for key, e in top:
+                extra = (f"  infeasible_at={e['boundary_to']!r}"
+                         if e.get("boundary_to") is not None else "")
+                print(f"  {key}: score {e['score']:+.2f}  "
+                      f"last={e['last_outcome']}{extra}")
     bundles = read_jsonl(EVIDENCE_LOG_PATH)
     if bundles:
         last = bundles[-1]

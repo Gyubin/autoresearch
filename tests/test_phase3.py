@@ -244,6 +244,8 @@ def test_gate_canary() -> None:
         "hypothesis": json.dumps(hyps[0].to_dict()),
         "coder_packet": json.dumps(grounding.for_hypothesis(hyps[0])),
         "certificate": json.dumps(engine.question_certificate(grounding)),
+        # Phase 4: the structured steering surface is proposer-visible too.
+        "move_guidance": json.dumps(grounding.move_guidance()),
     }
     contract = orch.load_contract()
     ctx = orch.ProposalContext(
@@ -617,11 +619,11 @@ def test_llm_fallback_and_budget(tmp: Path) -> None:
 # T14 — contract v3 validation
 # ---------------------------------------------------------------------------
 
-def test_contract_v3(tmp: Path) -> None:
+def test_contract_literature(tmp: Path) -> None:
     contract = orch.load_contract()
     lit = contract.literature
-    check("contract: v3 literature block parsed",
-          contract.schema_version == 3 and lit.enabled
+    check("contract: v4 literature block parsed",
+          contract.schema_version == 4 and lit.enabled
           and lit.retriever == "lexical"
           and lit.corpus_path == "literature/corpus/mock_corpus.json"
           and lit.llm_max_campaign_budget_usd is None)
@@ -638,7 +640,7 @@ def test_contract_v3(tmp: Path) -> None:
             check(f"contract: {name} rejected", True)
 
     expect_reject("schema_version 2",
-                  text.replace("schema_version: 3", "schema_version: 2"))
+                  text.replace("schema_version: 4", "schema_version: 2"))
     expect_reject("corpus outside literature/",
                   text.replace(
                       'corpus_path: "literature/corpus/mock_corpus.json"',
@@ -674,7 +676,7 @@ def main() -> int:
         test_injection_confinement(tmp / "t11")
         test_empty_and_disabled(tmp / "t12")
         test_llm_fallback_and_budget(tmp / "t13")
-        test_contract_v3(tmp / "t14")
+        test_contract_literature(tmp / "t14")
 
     print()
     if FAILS:

@@ -263,6 +263,21 @@ class LexicalRetriever:
         return scored
 
 
+def move_of(frm: Any, to: Any) -> str | None:
+    """Canonical move direction for a (from, to) intervention endpoint pair.
+
+    Shared vocabulary with the corpus tag enum (enable/disable/increase/
+    decrease). The orchestrator's Phase 4 search-momentum keys import this
+    function, so steering, grounding and momentum can never drift apart on
+    direction semantics. Pure; reads nothing.
+    """
+    if isinstance(to, bool):
+        return "enable" if to else "disable"
+    if isinstance(frm, (int, float)) and isinstance(to, (int, float)):
+        return "increase" if to > frm else "decrease"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Grounding bundle
 # ---------------------------------------------------------------------------
@@ -301,6 +316,46 @@ class Grounding:
             "conditions": rec["conditions"],
             "limitations": rec["limitations"],
         } for rec in self.evidence]
+
+    def move_guidance(self) -> list[dict]:
+        """Structured per-(intervention, move) literature stance for Phase 4
+        proposer steering. Categorical only — evidence ids and enum strings,
+        no claim prose, no floats — so it can enter proposer-visible
+        surfaces without growing the blindness/injection scan surface.
+
+        Pack stance already encodes the anti-laundering rules (off-model-
+        class and conditional claims are "adjacent") and any LLM analyst
+        downgrades, so records without a directional stance are skipped.
+        Pure method over this bundle; reads nothing else.
+        """
+        grouped: dict[tuple[str, str], dict[str, list[str]]] = {}
+        for rec in self.evidence:
+            tags = rec.get("tags") or {}
+            intervention = tags.get("intervention")
+            move = tags.get("move")
+            stance = rec.get("stance")
+            if (not intervention or move in (None, "", "none")
+                    or stance not in ("supports", "contradicts")):
+                continue
+            entry = grouped.setdefault((intervention, move),
+                                       {"supports": [], "contradicts": []})
+            entry[stance].append(rec["evidence_id"])
+        guidance = []
+        for (intervention, move), entry in sorted(grouped.items()):
+            if entry["supports"] and entry["contradicts"]:
+                stance = "mixed"
+            elif entry["supports"]:
+                stance = "supports"
+            else:
+                stance = "contradicts"
+            guidance.append({
+                "intervention": intervention,
+                "move": move,
+                "stance": stance,
+                "evidence_ids": sorted(set(entry["supports"]
+                                           + entry["contradicts"])),
+            })
+        return guidance
 
     def for_hypothesis(self, hypothesis: Any) -> list[dict]:
         """Full records cited by this hypothesis (supports-only by
@@ -496,6 +551,15 @@ class EvidenceEngine:
             "conditions": claim.get("conditions", ""),
             "limitations": list(claim["limitations"]),
             "matched_topics": [claim["tags"]["intervention"]],
+            # Structured directional tags (Phase 4 steering): enum strings
+            # from _TAG_VOCAB only — no prose, no numbers — so downstream
+            # consumers never have to parse claim text for direction.
+            "tags": {
+                "intervention": claim["tags"]["intervention"],
+                "move": claim["tags"]["move"],
+                "effect": claim["tags"]["effect"],
+                "model_class": claim["tags"]["model_class"],
+            },
             "retrieval": {"mode": "lexical", "query": query["query"],
                           "topic": query["topic"], "score": score,
                           "hop": hop},
@@ -561,14 +625,7 @@ class EvidenceEngine:
         norm = " ".join(_TOKEN_RE.findall(text.lower()))
         param = intervention.get("param")
         if param:
-            frm, to = intervention.get("from"), intervention.get("to")
-            if isinstance(to, bool):
-                move = "enable" if to else "disable"
-            elif isinstance(frm, (int, float)) and isinstance(
-                    to, (int, float)):
-                move = "increase" if to > frm else "decrease"
-            else:
-                move = None
+            move = move_of(intervention.get("from"), intervention.get("to"))
             return str(param), move, toks, norm
         return None, None, toks, norm
 

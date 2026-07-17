@@ -10,8 +10,8 @@
 # To intentionally change the contract: stop all runs, `chmod u+w` the file,
 # edit, then re-run `orchestrator.py init --force` to rebuild the manifest.
 # =============================================================================
-schema_version: 3
-contract_id: autoresearch-phase3-literature
+schema_version: 4
+contract_id: autoresearch-phase4-refinement
 
 objective: >
   Minimize held-out RMSE of the model trained by src/train.py. Interventions
@@ -62,7 +62,10 @@ budgets:
 
 portfolio:
   # Hypotheses executed in parallel per generation (isolated worktrees).
-  parallel_branches: 4
+  # Phase 4: raised 4 -> 8 as a set with halving below — a wider smoke rung
+  # feeds a same-cost dev rung. The heuristic proposer still fills at most
+  # one hypothesis per parameter (~6), so 8 is an upper bound, not a quota.
+  parallel_branches: 8
   # Dev-improving candidates forwarded to the blind admission gate.
   gate_top_k: 2
   # Gate epsilon: the winner must beat the incumbent's gate score by this
@@ -75,6 +78,14 @@ portfolio:
   # LLM coding worker budgets (per hypothesis).
   coder_max_turns: 25
   coder_max_budget_usd: 1.5
+  # Phase 4b successive halving: every branch runs the cheap smoke rung;
+  # only max(min_keep, ceil(parallel_branches * keep_fraction)) survivors
+  # by smoke score advance to the dev rung. Elimination is a BUDGET policy,
+  # never scientific evidence: pruned branches distill no insight.
+  halving:
+    enabled: true
+    keep_fraction: 0.5
+    min_keep: 2
 
 stop_conditions:
   # Consecutive generations without an admitted winner.
@@ -100,3 +111,43 @@ literature:
   # degrades to lexical grounding, mode "claude+budget_exhausted").
   llm_max_budget_usd: 0.5
   llm_max_campaign_budget_usd: null
+
+refinement:
+  # Phase 4a directed branch refinement (Gome-style search momentum +
+  # evidence-based move steering). enabled=false restores the exact Phase 3
+  # proposal behaviour (static priority + last-accepted-first). Momentum is
+  # a pure fold over experiment ledger records — dev signals and
+  # accept/reject bits only; gate scores cannot enter by construction.
+  enabled: true
+  # Geometric decay applied to every momentum score at each generation
+  # boundary, so stale directions fade.
+  momentum_decay: 0.5
+  # Fraction of a generation's slots that follow the steered ranking; the
+  # rest (at least 1 when k >= 2) are reserved for unexplored directions —
+  # zero momentum and no literature support (anti hypothesis-collapse).
+  exploit_fraction: 0.75
+  # Consecutive accepts in one (param, direction) before the proposer may
+  # take one accelerated (squared) step per generation.
+  accelerate_after: 2
+  # Rank heuristic moves by literature stance (supports first, contradicted
+  # moves demoted — never removed). Requires literature.enabled.
+  evidence_steering: true
+
+pairwise_gate:
+  # Phase 4c SciNav-style pairwise SELECTION (opt-in per run via
+  # `run --gate pairwise`; this block only permits and parameterizes it).
+  # Admission is ALWAYS the deterministic scalar epsilon rule on the blind
+  # gate split; when >= 2 candidates pass it, anonymized blind judges pick
+  # which one is admitted. Judges never see gate scores (their input is the
+  # contract, hypothesis certificates, bounded code diffs and dev metrics),
+  # and every vote is recorded in the gate ledger record next to the
+  # counterfactual scalar_winner. Judge failures fall back to the scalar
+  # selection deterministically.
+  enabled: true
+  judges: 3
+  # Kept distinct from the proposer/coder model on purpose (ARIS: judges
+  # from a different model family — approximated within the Claude family;
+  # the true cross-family reviewer is Phase 5).
+  judge_model: claude-haiku-4-5
+  judge_max_budget_usd: 0.4
+  judge_max_campaign_budget_usd: null
