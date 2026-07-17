@@ -1,15 +1,15 @@
 {
   "algorithm": "sha256",
-  "created_utc": "2026-07-17T13:32:26.640862+00:00",
+  "created_utc": "2026-07-17T16:42:48.142583+00:00",
   "files": {
     ".python-version": "a876e0b10411037a012498b9fe18d9bc1df32ed8b722a13564dc944ddcfd9135",
     "evaluation/dataset.py": "5ee4648b70995615bcb48d2b67ef047879044b2121aa812e2dade0d0b3a9bc0e",
     "evaluation/evaluate.py": "dd4fabbc346a9cde924eb166224e3b7874c711946d819491803ff90870ec87f2",
-    "evaluation/heldout_config.json": "2f2b6f800dfa68cca15f80a3738b0ef3895d62292515538889b5d6b28295b699",
+    "evaluation/heldout_config.json": "20fb87c1dee0639549608e871bbd3eaab846f48aebd6948c75096e1e312056d6",
     "literature/__init__.py": "72369fb2196e261e6907ddbbe91c869402955c9249e3b6ba544477cc9681ba0b",
     "literature/corpus/mock_corpus.json": "b697afbb13bf3efa7ebd80aa01db6401bd7aaa43257d9dc87c8027c0a376993e",
     "literature/engine.py": "9f352d5ef85cf3d7edfab2ff6b8f54eb69ae4ffba8124753b1c869e4fc55a816",
-    "orchestrator.py": "99d1df9b538ffc4625b806f416f8fc6e112f15dac13bcf70b5f6a3ae56add99e",
+    "orchestrator.py": "986dcf63f961d029d6023833456d00267ee85a9397b561e8c8b3e7966b20d670",
     "pyproject.toml": "22b03084ceb9648ae46bdebc5f1833da3dc16e06b22e28fef952e82ebbd8dec1",
     "research_contract.yaml": "562f86150713cebdb803140fcb8db97fd6bec0b6cff133dce4073d31e8b767a0",
     "uv.lock": "8e9fae89b8b6b8221ea66d380d83e64765f9e87aa386deb46ec341eb277a94f1"
