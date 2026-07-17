@@ -844,17 +844,17 @@ def test_soft_retry_preserves_batch() -> None:
 
 def test_contract_v4(tmp: Path) -> None:
     contract = orch.load_contract()
-    check("contract: v4 refinement block parsed",
+    check("contract: v5 refinement block parsed",
           contract.refinement.enabled
           and contract.refinement.momentum_decay == 0.5
           and contract.refinement.exploit_fraction == 0.75
           and contract.refinement.accelerate_after == 2
           and contract.refinement.evidence_steering)
-    check("contract: v4 halving block parsed",
+    check("contract: v5 halving block parsed",
           contract.portfolio.halving.enabled
           and contract.portfolio.halving.keep_fraction == 0.5
           and contract.portfolio.halving.min_keep == 2)
-    check("contract: v4 pairwise_gate block parsed",
+    check("contract: v5 pairwise_gate block parsed",
           contract.pairwise_gate.enabled
           and contract.pairwise_gate.judges == 3
           and contract.pairwise_gate.judge_model == "claude-haiku-4-5"
@@ -871,8 +871,8 @@ def test_contract_v4(tmp: Path) -> None:
         except orch.ContractError:
             check(f"contract: {name} rejected", True)
 
-    expect_reject("schema_version 3",
-                  text.replace("schema_version: 4", "schema_version: 3"))
+    expect_reject("schema_version 4",
+                  text.replace("schema_version: 5", "schema_version: 4"))
     expect_reject("unknown top-level block (typo)",
                   text + "\nrefinment:\n  enabled: true\n")
     expect_reject("momentum_decay 1.0",

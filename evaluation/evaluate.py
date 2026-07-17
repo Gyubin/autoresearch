@@ -49,8 +49,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-EVALUATOR_VERSION = "1.1.0"
-METRICS_SCHEMA_VERSION = "1.1"
+EVALUATOR_VERSION = "1.2.0"
+METRICS_SCHEMA_VERSION = "1.2"
 
 # Hardcoded budgets and metric identity — see trust model above. The
 # orchestrator cross-checks ALL of these against the contract at init and on
@@ -59,6 +59,12 @@ TRAIN_TIMEOUT_S = {"smoke": 20, "dev": 90}
 PRIMARY_METRIC_NAME = "heldout_rmse"
 PRIMARY_METRIC_DIRECTION = "minimize"
 SPLIT_NAMES = ("dev", "gate", "test")
+
+# Phase 5: upper bound on hidden test seeds for multi-seed finalist
+# reproduction. Must equal MAX_FINALIST_SEEDS in orchestrator.py; `init`
+# cross-checks the two (and that finalist_seeds <= this bound) and fails fast
+# on drift. It also bounds the per-invocation seed index the evaluator honors.
+MAX_TEST_SEEDS = 16
 
 MAX_ARTIFACT_BYTES = 1_000_000
 TAIL_BYTES = 2048
@@ -320,8 +326,36 @@ def _predict_rmse(
     return math.sqrt(sse / len(ys))
 
 
+def _predict_sq_errors(
+    model: dict, xs: list[list[float]], ys: list[float]
+) -> list[float] | None:
+    """Per-example squared errors; None if any prediction goes non-finite.
+
+    Phase 5: the paired bootstrap pairs baseline vs incumbent squared errors
+    example-by-example on the same test dataset. Emitted only for the test
+    split (dev/gate metrics surfaces are unchanged). sqrt(mean(errors)) equals
+    the scalar heldout_rmse by construction (cross-checked in the stats layer).
+    """
+    w = model["weights"]
+    b = model["bias"]
+    spec = model["spec"]
+    k = len(spec)
+    phi = [_engineer(x, spec) for x in xs]
+    if model["scaling"]:
+        m, s = model["means"], model["stds"]
+        phi = [[(row[j] - m[j]) / s[j] for j in range(k)] for row in phi]
+    errors: list[float] = []
+    for row, y in zip(phi, ys):
+        pred = b + sum(w[j] * row[j] for j in range(k))
+        if not math.isfinite(pred):
+            return None
+        d = pred - y
+        errors.append(d * d)
+    return errors
+
+
 def evaluate(workspace: Path, mode: str, split: str, run_id: str, nonce: str,
-             out_path: Path) -> dict:
+             out_path: Path, seed_index: int | None = None) -> dict:
     started = time.perf_counter()
     out_path.parent.mkdir(parents=True, exist_ok=True)  # log files land here too
     notes: list[str] = []
@@ -330,6 +364,7 @@ def evaluate(workspace: Path, mode: str, split: str, run_id: str, nonce: str,
         "schema_version": METRICS_SCHEMA_VERSION,
         "mode": mode,
         "split": split,
+        "seed_index": seed_index,
         "run_id": run_id,
         "nonce": nonce,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -411,16 +446,39 @@ def evaluate(workspace: Path, mode: str, split: str, run_id: str, nonce: str,
         metrics["degenerate"] = failure == "degenerate_weights"
         return done()
 
-    xs_h, ys_h = ds.load_split(HELDOUT_CONFIG, split)
+    effective_index = seed_index or 0
+    if split == "test" and effective_index >= MAX_TEST_SEEDS:
+        metrics["failure_class"] = "evaluator_error"
+        notes.append(f"seed_index {effective_index} exceeds MAX_TEST_SEEDS "
+                     f"{MAX_TEST_SEEDS}")
+        return done()
+    xs_h, ys_h = ds.load_split(HELDOUT_CONFIG, split, effective_index)
     metrics["dataset"] = {
         "train_seed": ds.TRAIN_SEED,
         "n_train": ds.N_TRAIN,
         "split": split,
+        "seed_index": effective_index,
         "n_heldout": len(ys_h),
         "heldout_fingerprint": ds.fingerprint(ys_h),
     }
 
-    heldout_rmse = _predict_rmse(model, xs_h, ys_h, ds.N_FEATURES)
+    # Phase 5: on the test split, compute per-example squared errors so the
+    # report's paired bootstrap can pair baseline vs incumbent example-by-
+    # example; heldout_rmse is then sqrt(mean(errors)). Other splits keep the
+    # scalar-only path unchanged (no new blindness surface on dev/gate).
+    sq_errors: list[float] | None = None
+    if split == "test":
+        sq_errors = _predict_sq_errors(model, xs_h, ys_h)
+        if sq_errors:
+            total = sum(sq_errors)
+            # Guard the SUM for non-finiteness too (parity with _predict_rmse):
+            # finite per-example errors can still sum to inf on extreme weights.
+            heldout_rmse = (math.sqrt(total / len(sq_errors))
+                            if math.isfinite(total) else None)
+        else:
+            heldout_rmse = None
+    else:
+        heldout_rmse = _predict_rmse(model, xs_h, ys_h, ds.N_FEATURES)
     if heldout_rmse is None:
         metrics["failure_class"] = "degenerate_weights"
         metrics["degenerate"] = True
@@ -448,6 +506,8 @@ def evaluate(workspace: Path, mode: str, split: str, run_id: str, nonce: str,
         "constant_baseline_rmse": constant_baseline_rmse,
         "feature_terms": len(model["spec"]),
     }
+    if sq_errors is not None:
+        metrics["metrics"]["per_example_sq_errors"] = sq_errors
 
     if heldout_rmse > constant_baseline_rmse:
         # Finite but worse than predicting the mean: no measurable skill.
@@ -478,6 +538,7 @@ def main() -> int:
     parser.add_argument("--workspace", required=True, type=Path)
     parser.add_argument("--mode", choices=("smoke", "dev"), default="dev")
     parser.add_argument("--split", choices=SPLIT_NAMES, default="dev")
+    parser.add_argument("--seed-index", type=int, default=None)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--run-id", default="")
     parser.add_argument("--nonce", default="")
@@ -486,17 +547,23 @@ def main() -> int:
     if args.mode == "smoke" and args.split != "dev":
         # gate/test are full-budget admission/report evaluations only.
         parser.error("--mode smoke is only valid with --split dev")
+    if args.seed_index is not None and args.split != "test":
+        # Only the test split has multiple seeds (Phase 5 finalist reproduction).
+        parser.error("--seed-index is only valid with --split test")
+    if args.seed_index is not None and args.seed_index < 0:
+        parser.error("--seed-index must be >= 0")
 
     try:
         metrics = evaluate(
             args.workspace.resolve(), args.mode, args.split, args.run_id,
-            args.nonce, args.out
+            args.nonce, args.out, seed_index=args.seed_index
         )
     except Exception as exc:  # infra failure: report loudly, exit nonzero
         crash = {
             "schema_version": METRICS_SCHEMA_VERSION,
             "mode": args.mode,
             "split": args.split,
+            "seed_index": args.seed_index,
             "run_id": args.run_id,
             "nonce": args.nonce,
             "executed": False,

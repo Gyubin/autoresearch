@@ -78,21 +78,59 @@ def load_train() -> tuple[list[list[float]], list[float]]:
 HELDOUT_SPLITS = ("dev", "gate", "test")
 
 
+def _split_seeds(entry: dict, split: str) -> list[int]:
+    """Seed list for a split entry (config schema v3).
+
+    dev/gate carry a single ``seed`` (a 1-element list here); ``test`` carries
+    a ``seeds`` list of N pairwise-distinct hidden seeds for Phase 5 multi-seed
+    finalist reproduction. Exactly one of the two keys must be present.
+    """
+    has_seed = "seed" in entry
+    has_seeds = "seeds" in entry
+    if has_seed == has_seeds:
+        raise KeyError(
+            f"split {split!r} entry must have exactly one of 'seed'/'seeds'")
+    if has_seed:
+        return [int(entry["seed"])]
+    seeds = entry["seeds"]
+    if not isinstance(seeds, list) or not seeds:
+        raise KeyError(f"split {split!r} 'seeds' must be a non-empty list")
+    ints = [int(s) for s in seeds]
+    if len(set(ints)) != len(ints):
+        raise KeyError(f"split {split!r} 'seeds' must be pairwise-distinct")
+    return ints
+
+
 def load_split(
-    config_path: str | Path, split: str
+    config_path: str | Path, split: str, seed_index: int = 0
 ) -> tuple[list[list[float]], list[float]]:
     """One hidden held-out split (dev/gate/test). Root evaluator only.
 
-    Config schema v2: {"schema_version": 2, "splits": {name: {seed, size}}}.
+    Config schema v3: {"schema_version": 3, "splits": {
+        "dev": {"seed": int}, "gate": {"seed": int},
+        "test": {"seeds": [int, ...]}}}.
+
+    ``seed_index`` selects among the test split's seeds (Phase 5 multi-seed
+    finalist reproduction); dev/gate accept only seed_index 0.
     """
     if split not in SPLIT_SIZES:
         raise KeyError(f"unknown split {split!r} (have: {sorted(SPLIT_SIZES)})")
     cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    if cfg.get("schema_version") != 3:
+        raise KeyError(
+            f"heldout config schema_version must be 3, got "
+            f"{cfg.get('schema_version')!r} (stale config? re-run "
+            f"`orchestrator.py init --force`)")
     splits = cfg.get("splits")
     if not isinstance(splits, dict) or split not in splits:
         have = sorted(splits) if isinstance(splits, dict) else "none"
         raise KeyError(f"split {split!r} missing from heldout config (have: {have})")
-    return generate(int(splits[split]["seed"]), SPLIT_SIZES[split])
+    seeds = _split_seeds(splits[split], split)
+    if not 0 <= seed_index < len(seeds):
+        raise IndexError(
+            f"seed_index {seed_index} out of range for split {split!r} "
+            f"({len(seeds)} seed(s))")
+    return generate(seeds[seed_index], SPLIT_SIZES[split])
 
 
 def fingerprint(values: list[float], k: int = 32) -> str:

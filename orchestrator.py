@@ -67,6 +67,12 @@ import yaml
 from literature.engine import (ANTI_INJECTION_SENTENCE, CorpusError,
                                build_engine, load_corpus, move_of)
 
+# The assurance package (Phase 5) is likewise a separate, protected module:
+# stdlib-only, never imports the orchestrator, and performs no file IO (all
+# reads/writes stay here). See assurance/__init__.py for the closure rules.
+from assurance import (claims as claims_builder, families, figures, gate,
+                       report_md, reviewer, stats)
+
 # ---------------------------------------------------------------------------
 # Paths and constants
 # ---------------------------------------------------------------------------
@@ -89,12 +95,20 @@ EVIDENCE_DIR = EXPERIMENTS_DIR / "evidence"
 EVIDENCE_LOG_PATH = EVIDENCE_DIR / "evidence.jsonl"
 QUESTION_CERT_PATH = EVIDENCE_DIR / "question_certificate.json"
 INSIGHTS_PATH = ROOT / "insight_memory.json"
+# Phase 5 claim-evidence ledger (derived artifact, rebuilt whole-file at report
+# time; gitignored like the rest of experiments/).
+CLAIMS_PATH = EXPERIMENTS_DIR / "claims.jsonl"
 WORKTREES_DIR = ROOT / ".worktrees"
 # Outside experiments/ so `init --force` (which clears experiments/) can never
 # delete a lock file another process holds.
 LOCK_PATH = ROOT / ".orchestrator.lock"
 
 STATE_SCHEMA_VERSION = 2
+
+# Phase 5: upper bound on hidden test seeds for finalist reproduction. Must
+# equal MAX_TEST_SEEDS in evaluation/evaluate.py; `init` cross-checks the two
+# via _load_evaluator_declarations and fails fast on drift.
+MAX_FINALIST_SEEDS = 16
 
 # Top-level directories never scanned for protected files (runtime/venv/tooling).
 SCAN_EXCLUDE = {".git", ".venv", ".worktrees", "experiments", "artifacts",
@@ -312,6 +326,37 @@ class PairwiseGate:
 
 
 @dataclass(frozen=True)
+class Assurance:
+    """Phase 5: scientific assurance (Blueprint Layer 8). Multi-seed finalist
+    reproduction + paired-example bootstrap CIs. `finalist_seeds` is a COUNT;
+    the seed values live in the git-untracked heldout_config.json."""
+    finalist_seeds: int
+    bootstrap_resamples: int
+    confidence_level: float
+
+
+@dataclass(frozen=True)
+class Reviewer:
+    """Phase 5: cross-model adversarial reviewer (ARIS). A different model
+    family (codex) audits claims against raw test data. Advisory only; never
+    falls back to a Claude reviewer."""
+    enabled: bool
+    backend: str
+    model: str | None
+    timeout_s: int
+    max_prompt_bytes: int
+
+
+@dataclass(frozen=True)
+class HumanGate:
+    """Phase 5: human approval gate (Blueprint Layer 9). Gates the single-use
+    test split (publication analog). Approval state is derived from the ledger,
+    never persisted in state.json."""
+    enabled: bool
+    require_approval_for: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Literature:
     enabled: bool
     corpus_path: str
@@ -340,6 +385,9 @@ class ResearchContract:
     literature: Literature
     refinement: Refinement
     pairwise_gate: PairwiseGate
+    assurance: Assurance
+    reviewer: Reviewer
+    human_gate: HumanGate
 
 
 def _require(mapping: dict, key: str, kind: type | tuple, ctx: str) -> Any:
@@ -371,9 +419,9 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         raise ContractError("contract root must be a mapping")
 
     schema_version = _require(raw, "schema_version", int, "")
-    if schema_version != 4:
+    if schema_version != 5:
         raise ContractError(f"unsupported contract schema_version {schema_version} "
-                            f"(this orchestrator expects 4)")
+                            f"(this orchestrator expects 5)")
 
     # Top-level whitelist (new in v4): an unknown block would previously be
     # ignored silently, so a typo like `refinment:` could disable a whole
@@ -383,7 +431,7 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
                   "primary_metric", "secondary_metrics", "editable_globs",
                   "protected_globs", "budgets", "portfolio",
                   "stop_conditions", "literature", "refinement",
-                  "pairwise_gate"}
+                  "pairwise_gate", "assurance", "reviewer", "human_gate"}
     unknown = sorted(set(raw) - known_keys)
     if unknown:
         raise ContractError(f"contract: unknown top-level keys {unknown}")
@@ -579,6 +627,61 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
             "refinement.evidence_steering requires literature.enabled "
             "(steering ranks move directions by literature stance)")
 
+    # Phase 5 assurance block (Layer 8): multi-seed finalist + bootstrap CIs.
+    as_raw = _require(raw, "assurance", dict, "")
+    assurance = Assurance(
+        finalist_seeds=_require(as_raw, "finalist_seeds", int, "assurance"),
+        bootstrap_resamples=_require(as_raw, "bootstrap_resamples", int,
+                                     "assurance"),
+        confidence_level=float(_require(as_raw, "confidence_level",
+                                        (int, float), "assurance")),
+    )
+    if not 1 <= assurance.finalist_seeds <= MAX_FINALIST_SEEDS:
+        raise ContractError(
+            f"assurance.finalist_seeds must be in [1, {MAX_FINALIST_SEEDS}]")
+    if assurance.bootstrap_resamples < 100:
+        raise ContractError(
+            "assurance.bootstrap_resamples must be >= 100 (percentile CI)")
+    if assurance.confidence_level not in (0.90, 0.95, 0.99):
+        raise ContractError(
+            "assurance.confidence_level must be one of 0.90, 0.95, 0.99")
+
+    # Phase 5 reviewer block (Layer 8, ARIS): cross-model adversarial review.
+    rv_raw = _require(raw, "reviewer", dict, "")
+    rv_model = rv_raw.get("model")
+    if rv_model is not None and (
+            not isinstance(rv_model, str) or not rv_model.strip()):
+        raise ContractError("reviewer.model must be a non-empty string or null")
+    reviewer = Reviewer(
+        enabled=_require(rv_raw, "enabled", bool, "reviewer"),
+        backend=_require(rv_raw, "backend", str, "reviewer"),
+        model=rv_model,
+        timeout_s=_require(rv_raw, "timeout_s", int, "reviewer"),
+        max_prompt_bytes=_require(rv_raw, "max_prompt_bytes", int, "reviewer"),
+    )
+    if reviewer.backend != "codex":
+        raise ContractError(
+            f"reviewer.backend {reviewer.backend!r} is not implemented "
+            f"(Phase 5 supports: codex)")
+    if reviewer.timeout_s <= 0:
+        raise ContractError("reviewer.timeout_s must be positive")
+    if reviewer.max_prompt_bytes < 1000:
+        raise ContractError("reviewer.max_prompt_bytes must be >= 1000")
+
+    # Phase 5 human_gate block (Layer 9): approval on the single-use test split.
+    hg_raw = _require(raw, "human_gate", dict, "")
+    hg_ops = _str_tuple(hg_raw, "require_approval_for", "human_gate")
+    allowed_ops = {"first_report", "force_report"}
+    unknown_ops = sorted(set(hg_ops) - allowed_ops)
+    if unknown_ops:
+        raise ContractError(
+            f"human_gate.require_approval_for has unknown ops {unknown_ops} "
+            f"(allowed: {sorted(allowed_ops)})")
+    human_gate = HumanGate(
+        enabled=_require(hg_raw, "enabled", bool, "human_gate"),
+        require_approval_for=hg_ops,
+    )
+
     return ResearchContract(
         schema_version=schema_version,
         contract_id=_require(raw, "contract_id", str, ""),
@@ -597,6 +700,9 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         literature=literature,
         refinement=refinement,
         pairwise_gate=pairwise_gate,
+        assurance=assurance,
+        reviewer=reviewer,
+        human_gate=human_gate,
     )
 
 
@@ -2010,11 +2116,13 @@ class ClaudeCoder:
 
 def run_evaluator(guard: ProtectionGuard, workspace: Path, mode: str,
                   out_path: Path, run_id: str, timeout_s: int,
-                  split: str = "dev") -> dict:
+                  split: str = "dev", seed_index: int | None = None) -> dict:
     nonce = secrets.token_hex(16)
     cmd = [sys.executable, "-B", str(EVALUATOR_PATH),
            "--workspace", str(workspace), "--mode", mode, "--split", split,
            "--out", str(out_path), "--run-id", run_id, "--nonce", nonce]
+    if seed_index is not None:
+        cmd += ["--seed-index", str(seed_index)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
                               timeout=timeout_s + 60)
@@ -2039,6 +2147,11 @@ def run_evaluator(guard: ProtectionGuard, workspace: Path, mode: str,
         raise ProtectionViolation(
             f"split echo mismatch for {run_id}: asked {split!r}, evaluator "
             f"reports {metrics.get('split')!r}"
+        )
+    if metrics.get("seed_index") != seed_index:
+        raise ProtectionViolation(
+            f"seed_index echo mismatch for {run_id}: asked {seed_index!r}, "
+            f"evaluator reports {metrics.get('seed_index')!r}"
         )
     manifest_files = guard.load_manifest()["files"]
     expected = manifest_files.get("evaluation/evaluate.py")
@@ -2332,8 +2445,14 @@ def _momentum_weight(vector: dict) -> tuple[float, Any]:
 
 
 def extract_update_vectors(records: list[dict], *,
-                           direction: str = "minimize") -> list[dict]:
-    """Structured directional signals from completed experiments."""
+                           direction: str = "minimize",
+                           coder_families: bool = False) -> list[dict]:
+    """Structured directional signals from completed experiments.
+
+    When coder_families is on (Phase 5, gated by refinement.enabled), a coder
+    experiment's stored coder_family becomes its momentum `move`, so its key is
+    e.g. "coder:feature_spec_interaction" instead of the coarse "coder:none".
+    Off (or family "none"/absent) reproduces the Phase 4 "coder:none" fold."""
     corrected = corrected_run_ids(records)
     vectors: list[dict] = []
     for r in records:
@@ -2360,11 +2479,18 @@ def extract_update_vectors(records: list[dict], *,
             if direction == "maximize":
                 rel = -rel
             delta_rel = round(rel, 6)  # positive == improvement, dev values only
+        fam = r.get("coder_family")
+        if param is not None:
+            move = move_of(frm, to)
+        elif coder_families and fam and fam != "none":
+            move = fam
+        else:
+            move = None
         vectors.append({
             "generation": r.get("generation"),
             "run_id": r.get("run_id"),
             "param": param if param is not None else "coder",
-            "move": move_of(frm, to) if param is not None else None,
+            "move": move,
             "from": frm,
             "to": to,
             "delta_rel": delta_rel,
@@ -2722,12 +2848,18 @@ def _experiment_smoke_stage(ctx: LoopContext, spec: ExperimentSpec,
         return record
     record["commit"] = commit
 
-    diff_bytes = len(ctx.git.run("diff", f"{spec.base_commit}..HEAD",
-                                 cwd=spec.worktree).stdout.encode())
+    diff_text = ctx.git.run("diff", f"{spec.base_commit}..HEAD",
+                            cwd=spec.worktree).stdout
+    diff_bytes = len(diff_text.encode())
     if diff_bytes > MAX_DIFF_BYTES:
         record.update(verdict="invalid_implementation",
                       failure_class=f"oversized_diff: {diff_bytes} bytes")
         return record
+    # Phase 5: classify a coder change's intervention family from its diff and
+    # STORE it on the record (like verdict/decision). Momentum reads the stored
+    # field at recompute time, so no diff is re-derived and replay == live.
+    if hyp.executor == "coder":
+        record["coder_family"] = families.classify(hyp.to_dict(), diff_text)
 
     bad = _glob_violations(ctx, spec)
     if bad:
@@ -3169,7 +3301,8 @@ def run_generation(ctx: LoopContext, state: dict) -> dict | None:
     if contract.refinement.enabled:
         update_vectors = extract_update_vectors(
             read_jsonl(LEDGER_PATH),
-            direction=contract.primary_metric.direction)
+            direction=contract.primary_metric.direction,
+            coder_families=True)
         momentum = search_momentum_table(
             update_vectors, decay=contract.refinement.momentum_decay)
     grounding = None
@@ -3497,6 +3630,7 @@ def _load_evaluator_declarations() -> dict:
         "metric_name": module.PRIMARY_METRIC_NAME,
         "metric_direction": module.PRIMARY_METRIC_DIRECTION,
         "split_names": tuple(module.SPLIT_NAMES),
+        "max_test_seeds": int(module.MAX_TEST_SEEDS),
     }
 
 
@@ -3552,6 +3686,19 @@ def cmd_init(args: argparse.Namespace) -> int:
             f"split drift: this orchestrator expects dev/gate/test but the "
             f"evaluator declares {declared['split_names']}"
         )
+    # Phase 5: the evaluator's MAX_TEST_SEEDS bound must agree with this
+    # orchestrator's, and the contract's finalist_seeds must fit within it.
+    if declared["max_test_seeds"] != MAX_FINALIST_SEEDS:
+        raise ContractError(
+            f"seed-bound drift: orchestrator MAX_FINALIST_SEEDS="
+            f"{MAX_FINALIST_SEEDS} but evaluator MAX_TEST_SEEDS="
+            f"{declared['max_test_seeds']}"
+        )
+    if contract.assurance.finalist_seeds > declared["max_test_seeds"]:
+        raise ContractError(
+            f"assurance.finalist_seeds {contract.assurance.finalist_seeds} "
+            f"exceeds evaluator MAX_TEST_SEEDS {declared['max_test_seeds']}"
+        )
 
     if not git.is_repo():
         git.init_repo()
@@ -3565,23 +3712,29 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("[init] --force: cleared experiments/")
 
     if not HELDOUT_CONFIG_PATH.exists() or args.force:
-        seeds = set()
-        while len(seeds) < 3:  # pairwise-distinct hidden seeds
+        # Phase 5: dev + gate + N pairwise-distinct test seeds (config v3).
+        # N = contract.assurance.finalist_seeds reproduces the finalist on N
+        # independent hidden test datasets for a bootstrap CI.
+        n_test = contract.assurance.finalist_seeds
+        seeds: set[int] = set()
+        while len(seeds) < 2 + n_test:  # pairwise-distinct hidden seeds
             seeds.add(int.from_bytes(os.urandom(8), "big") % (2**31 - 1))
-        dev_seed, gate_seed, test_seed = sorted(seeds)
+        ordered = sorted(seeds)
+        dev_seed, gate_seed = ordered[0], ordered[1]
+        test_seeds = ordered[2:]
         atomic_write_json(HELDOUT_CONFIG_PATH, {
-            "schema_version": 2,
+            "schema_version": 3,
             "splits": {
                 "dev": {"seed": dev_seed},
                 "gate": {"seed": gate_seed},
-                "test": {"seed": test_seed},
+                "test": {"seeds": test_seeds},
             },
             "created_utc": utc_now(),
             "note": "hidden held-out seeds (dev=search, gate=blind admission, "
-                    "test=final report); untracked by git on purpose",
+                    "test=N-seed final report); untracked by git on purpose",
         })
-        print("[init] generated evaluation/heldout_config.json "
-              "(hidden dev/gate/test seeds)")
+        print(f"[init] generated evaluation/heldout_config.json "
+              f"(hidden dev/gate seeds + {n_test} test seeds)")
 
     guard.write_manifest()
     print(f"[init] protection manifest written "
@@ -3882,7 +4035,8 @@ def cmd_status(_: argparse.Namespace) -> int:
                   f"{g.get('winner') or 'no winner'}")
     if contract.refinement.enabled:
         momentum = search_momentum_table(
-            extract_update_vectors(records, direction=pm.direction),
+            extract_update_vectors(records, direction=pm.direction,
+                                   coder_families=True),
             decay=contract.refinement.momentum_decay)
         if momentum:
             top = sorted(momentum.items(),
@@ -3911,7 +4065,56 @@ def cmd_status(_: argparse.Namespace) -> int:
         print(f"  last: mode={last.get('mode')}  stances={stances}  "
               f"novelty={novelty or '(pre-proposal)'}  "
               f"stop={coverage.get('stopped_because')}")
+
+    # Phase 5: human approval gate + last review status for the CURRENT intent.
+    if contract.human_gate.enabled:
+        baseline_rec = next((r for r in records
+                             if r.get("record_type") == "baseline"), None)
+        if baseline_rec is not None and state.get("best_commit"):
+            sealed = [r for r in records
+                      if r.get("record_type") == "final_report"]
+            fp = {
+                "incumbent_commit": state.get("best_commit"),
+                "baseline_commit": baseline_rec["commit"],
+                "contract_sha256": sha256_file(CONTRACT_PATH),
+                "evaluator_sha256": sha256_file(EVALUATOR_PATH),
+                "prior_sealed_reports": len(sealed),
+            }
+            status = gate.approval_status(records, fp)
+            rid = gate.request_id_for(fp)
+            print(f"\napproval (report intent {rid}): {status}")
+            if status == "pending":
+                print(f"  run: uv run python orchestrator.py approve {rid}")
+    reviews = [r for r in records if r.get("record_type") == "review"]
+    if reviews:
+        rv = reviews[-1]
+        print(f"review: {rv.get('status')} (overall={rv.get('overall')}) "
+              f"[{str(rv.get('review_sha256'))[:12]}]")
     return 0
+
+
+def _reviewer_raw_test(baseline_metrics: list[dict],
+                       incumbent_metrics: list[dict], boot) -> dict:
+    """Whitelisted TRUSTED raw test data for the reviewer packet: per-seed
+    heldout/train/gap from the evaluator + the aggregate CI. Contains NO gate
+    scores (gate blindness holds by construction in the reviewer packet)."""
+    def row(m: dict) -> dict:
+        mm = m.get("metrics") or {}
+        return {"heldout_rmse": mm.get("heldout_rmse"),
+                "train_rmse": mm.get("train_rmse_recomputed"),
+                "generalization_gap": mm.get("generalization_gap"),
+                "n_examples": (m.get("dataset") or {}).get("n_heldout"),
+                "failure_class": m.get("failure_class")}
+    per_seed = [{"seed_index": k, "baseline": row(baseline_metrics[k]),
+                 "incumbent": row(incumbent_metrics[k])}
+                for k in range(len(baseline_metrics))]
+    return {"per_seed": per_seed,
+            "aggregate": {"n_seeds": boot.n_seeds,
+                          "rmse_baseline_pooled": boot.rmse_baseline_pooled,
+                          "rmse_incumbent_pooled": boot.rmse_incumbent_pooled,
+                          "effect_abs": boot.effect_abs,
+                          "ci_abs": list(boot.ci_abs) if boot.ci_abs else None,
+                          "confidence": boot.confidence}}
 
 
 def cmd_report(args: argparse.Namespace) -> int:
@@ -3940,74 +4143,138 @@ def cmd_report(args: argparse.Namespace) -> int:
     if baseline_rec is None:
         raise OrchestratorError("no baseline record in the ledger")
 
-    report_dir = EXPERIMENTS_DIR / "report"
+    # Phase 5: verify protection BEFORE any test-split spend. cmd_report did
+    # not previously verify; a tampered evaluator/dataset/config (all in the
+    # manifest) must fail here, not silently score the report.
+    violations = guard.verify()
+    if violations:
+        raise ProtectionViolation(
+            "protected files modified: " + "; ".join(violations))
 
-    def test_eval(name: str, commit: str) -> float | None:
+    # Phase 5 human approval gate (Layer 9): the test split is single-use, so a
+    # human approves the INTENT — commits, dev numbers, seed plan, disclosure —
+    # BEFORE any test number is computed. Approval is derived from the ledger
+    # (approval_request/approval_decision records), never persisted in state.
+    sealed_reports = [r for r in records
+                      if r.get("record_type") == "final_report"]
+    fingerprint = {
+        "incumbent_commit": state.get("best_commit"),
+        "baseline_commit": baseline_rec["commit"],
+        "contract_sha256": sha256_file(CONTRACT_PATH),
+        "evaluator_sha256": sha256_file(EVALUATOR_PATH),
+        "prior_sealed_reports": len(sealed_reports),
+    }
+    request_id = gate.request_id_for(fingerprint)
+    require = contract.human_gate.require_approval_for
+    needs_approval = contract.human_gate.enabled and (
+        (not sealed_reports and "first_report" in require)
+        or (bool(args.force) and bool(sealed_reports)
+            and "force_report" in require))
+    if needs_approval:
+        status = gate.approval_status(records, fingerprint)
+        if status == "denied":
+            raise OrchestratorError(
+                f"report intent {request_id} was denied by the human gate")
+        if status in ("none", "approved_stale", "approved_consumed"):
+            experiments0 = [r for r in records
+                            if r.get("record_type") == "experiment"]
+            payload = {
+                "dev_baseline": state.get("baseline_primary"),
+                "dev_incumbent": state.get("best_primary"),
+                "n_seeds": contract.assurance.finalist_seeds,
+                "accepted_count": sum(1 for r in experiments0
+                                      if r.get("decision") == "accept"),
+                "disclosure_so_far": {
+                    "experiments": len(experiments0),
+                    "generations": state.get("generation", 0),
+                    "prior_sealed_reports": len(sealed_reports),
+                },
+            }
+            req = gate.make_request(state.get("campaign_id"), fingerprint,
+                                    payload, utc_now())
+            append_jsonl(LEDGER_PATH, req)
+            print(f"approval required before the test split is touched.\n"
+                  f"  request_id : {req['request_id']}\n"
+                  f"  intent     : incumbent "
+                  f"{(fingerprint['incumbent_commit'] or '')[:12]} vs baseline "
+                  f"{fingerprint['baseline_commit'][:12]}, "
+                  f"{payload['n_seeds']} test seed(s)\n"
+                  f"  review it, then: uv run python orchestrator.py approve "
+                  f"{req['request_id']}")
+            return 3
+        if status == "pending":
+            print(f"approval pending for request_id {request_id} — run: "
+                  f"uv run python orchestrator.py approve {request_id}")
+            return 3
+        # status == "approved_fresh": fall through to the test-split evaluation.
+
+    report_dir = EXPERIMENTS_DIR / "report"
+    # One wall-clock stamp for the whole report: report.md embeds its date and
+    # the sealed final_report records timestamp_utc — sourcing both from the
+    # SAME stamp makes report.md reproducible from the ledger (re-render with
+    # final_report.timestamp_utc[:10]) instead of drifting across calendar days.
+    report_ts = utc_now()
+    # Write-ahead: record the test-split ATTEMPT before spending it, so a crash
+    # mid-report still discloses that the hidden test data was accessed.
+    append_jsonl(LEDGER_PATH, {
+        "record_type": "report_attempt",
+        "timestamp_utc": report_ts,
+        "campaign_id": state.get("campaign_id"),
+        "request_id": request_id,
+        "fingerprint": fingerprint,
+    })
+
+    # --- multi-seed test evaluation (Phase 5) ---------------------------------
+    figures_dir = report_dir / "figures"
+    n_seeds = contract.assurance.finalist_seeds
+    baseline_commit = baseline_rec["commit"]
+    # best_commit is always set post-init; fall back to baseline defensively so
+    # the aliased path (no admitted winner) is taken rather than crashing.
+    incumbent_commit = state.get("best_commit") or baseline_commit
+    aliased = incumbent_commit == baseline_commit
+
+    def eval_role(role: str, commit: str) -> list[dict]:
         if git.head() == commit and not git.status_paths(include_untracked=False):
             workspace, cleanup = ROOT, False
         else:
-            workspace = WORKTREES_DIR / f"report-{name}"
+            workspace = WORKTREES_DIR / f"report-{role}"
             git.worktree_remove(workspace)
             git.worktree_add_detached(workspace, commit)
             cleanup = True
         try:
-            metrics = run_evaluator(guard, workspace, "dev",
-                                    report_dir / f"{name}_test.json",
-                                    f"report-{name}",
-                                    contract.budgets.dev_train_timeout_s,
-                                    split="test")
+            return [run_evaluator(
+                        guard, workspace, "dev",
+                        report_dir / f"{role}_test_s{k}.json",
+                        f"report-{role}-s{k}",
+                        contract.budgets.dev_train_timeout_s,
+                        split="test", seed_index=k)
+                    for k in range(n_seeds)]
         finally:
             if cleanup:
                 git.worktree_remove(workspace)
-        return (metrics.get("primary_metric") or {}).get("value")
 
-    baseline_test = test_eval("baseline", baseline_rec["commit"])
-    incumbent_test = test_eval("incumbent", state["best_commit"])
+    baseline_metrics = eval_role("baseline", baseline_commit)
+    # When no candidate was admitted the incumbent IS the baseline: its runs
+    # would be bit-identical, so alias them rather than burn N more test evals.
+    incumbent_metrics = (baseline_metrics if aliased
+                         else eval_role("incumbent", incumbent_commit))
+
+    # --- paired-example bootstrap CI ------------------------------------------
+    boot_seed = stats.derive_bootstrap_seed(
+        state.get("campaign_id") or "", baseline_commit, incumbent_commit or "")
+    errs_b, errs_inc, seed_stats = stats.extract_paired_errors(
+        baseline_metrics, incumbent_metrics)
+    boot = stats.paired_bootstrap(
+        errs_b, errs_inc, seed_stats,
+        resamples=contract.assurance.bootstrap_resamples, seed=boot_seed,
+        confidence=contract.assurance.confidence_level)
 
     experiments = [r for r in records if r.get("record_type") == "experiment"]
     gates = [r for r in records if r.get("record_type") == "gate"]
-    gate_eval_count = (
-        sum(len(g.get("results") or {}) for g in gates)
-        + sum(1 for g in gates if g.get("incumbent_evaluated"))
-    )
+    gate_eval_count = (sum(len(g.get("results") or {}) for g in gates)
+                       + sum(1 for g in gates if g.get("incumbent_evaluated")))
 
-    relative = None
-    if isinstance(baseline_test, float) and isinstance(incumbent_test, float):
-        relative = ((baseline_test - incumbent_test) / abs(baseline_test)
-                    if pm.direction == "minimize"
-                    else (incumbent_test - baseline_test) / abs(baseline_test))
-
-    report = {
-        "record_type": "final_report",
-        "timestamp_utc": utc_now(),
-        "campaign_id": state.get("campaign_id"),
-        "contract_id": contract.contract_id,
-        "contract_sha256": sha256_file(CONTRACT_PATH),
-        "evaluator_sha256": sha256_file(EVALUATOR_PATH),
-        "baseline_commit": baseline_rec["commit"],
-        "incumbent_commit": state.get("best_commit"),
-        "test": {"baseline": baseline_test, "incumbent": incumbent_test,
-                 "relative_improvement": relative},
-        "dev": {"baseline": state.get("baseline_primary"),
-                "incumbent": state.get("best_primary")},
-        "multiple_testing_disclosure": {
-            "experiments": len(experiments),
-            "gate_evaluations": gate_eval_count,
-            "test_evaluations": len(prior_reports) + 1,
-            "generations": state.get("generation", 0),
-            "accepted": sum(1 for r in experiments
-                            if r.get("decision") == "accept"),
-            "note": "the incumbent's cached gate score was itself "
-                    "gate-selected, so the admission bar errs conservative",
-        },
-        "selection_rule": gates[-1].get("selection_rule") if gates else None,
-        "stop_state": {"stagnation": state.get("stagnation"),
-                       "round": state.get("round")},
-    }
-
-    # Phase 3: evidence audit — every accepted hypothesis's citation must
-    # resolve to a concrete (paper, claim, locator); an unresolvable id is
-    # citation fraud and fails the report hard.
+    # --- evidence audit (Phase 3): an unresolvable citation fails hard --------
     bundles = read_jsonl(EVIDENCE_LOG_PATH)
     evidence_index: dict[str, dict] = {}
     for bundle in bundles:
@@ -4024,22 +4291,12 @@ def cmd_report(args: argparse.Namespace) -> int:
                 raise OrchestratorError(
                     f"evidence audit failed: {r.get('run_id')} cites "
                     f"{evidence_id} but no grounding record resolves it")
-            audit.append({"run_id": r.get("run_id"),
-                          "evidence_id": evidence_id,
+            audit.append({"run_id": r.get("run_id"), "evidence_id": evidence_id,
                           "paper_id": rec.get("canonical_paper_id"),
                           "claim": rec.get("claim"),
                           "locator": rec.get("locator")})
-    report["literature"] = {
-        "corpus_id": bundles[-1].get("corpus_id") if bundles else None,
-        "corpus_sha256": bundles[-1].get("corpus_sha256") if bundles else None,
-        "grounding_events": len(bundles),
-        "evidence_records": len(evidence_index),
-        "contradictions_surfaced": len({
-            json.dumps(c, sort_keys=True)
-            for b in bundles for c in b.get("contradictions") or []}),
-        "evidence_audit": audit,
-    } if bundles else None
-    # Cost aggregation across all four LLM spend sources.
+
+    # --- cost aggregation (4-way) ---------------------------------------------
     costs = {
         "proposal_usd": round(sum(r.get("proposal_cost_usd") or 0.0
                                   for r in experiments), 4),
@@ -4050,11 +4307,205 @@ def cmd_report(args: argparse.Namespace) -> int:
         "pairwise_judge_usd": round(_judge_campaign_spend(records), 4),
     }
     costs["total_usd"] = round(sum(costs.values()), 4)
-    report["costs"] = costs
 
+    # --- multiple-testing disclosure (honest counting) -----------------------
+    inv_this = n_seeds * (1 if aliased else 2)
+    prior_inv = sum(
+        (r.get("multiple_testing_disclosure") or {}).get(
+            "test_invocations_this_report", 2)
+        for r in sealed_reports)
+    # A report_attempt whose request_id was never sealed by a final_report is a
+    # CRASHED report: it wrote the write-ahead marker and (likely) spent test
+    # evals that left per-seed JSON on disk — a real peek. Its accesses must be
+    # disclosed too, or the honesty guarantee is a no-op exactly in the crash
+    # case. We can't know how far a crashed attempt got, so we count it at the
+    # current per-report cost (conservative: over-disclose exposure, never
+    # under). Ground truth stays reconstructable from the report_attempt records.
+    consumed = gate.consumed_request_ids(records)
+    crashed = [r for r in records
+               if r.get("record_type") == "report_attempt"
+               and r.get("request_id") not in consumed]
+    n_crashed = len(crashed)
+    disclosure = {
+        "experiments": len(experiments),
+        "gate_evaluations": gate_eval_count,
+        "generations": state.get("generation", 0),
+        "accepted": sum(1 for r in experiments if r.get("decision") == "accept"),
+        "report_events": len(sealed_reports) + n_crashed + 1,
+        "sealed_reports": len(sealed_reports),
+        "crashed_report_attempts": n_crashed,
+        "test_seeds": n_seeds,
+        "test_invocations_this_report": inv_this,
+        "test_invocations_total": prior_inv + n_crashed * inv_this + inv_this,
+        "incumbent_runs_aliased": aliased,
+        "note": "one invocation = one (candidate, seed) evaluator run on the "
+                "test split; report_events counts peek-and-retry opportunities "
+                "(sealed reports + crashed attempts + this one). Crashed "
+                "attempts are counted at the current per-report cost "
+                "(conservative over-disclosure).",
+    }
+
+    # --- claim-evidence ledger (derived; rebuilt whole-file) ------------------
+    meta = {
+        "objective": contract.objective, "metric_name": pm.name,
+        "metric_direction": pm.direction,
+        "min_relative_improvement": pm.min_relative_improvement,
+        "contract_id": contract.contract_id,
+        "campaign_id": state.get("campaign_id"),
+        "baseline_commit": baseline_commit, "incumbent_commit": incumbent_commit,
+        "dev_baseline": state.get("baseline_primary"),
+        "dev_incumbent": state.get("best_primary"),
+        "incumbent_runs_aliased": aliased,
+    }
+    claim_list = claims_builder.build_claims(
+        records, boot, evidence_index, disclosure, costs, meta)
+    claims_payload = claims_builder.claims_jsonl_payload(claim_list)
+    atomic_write_text(CLAIMS_PATH, claims_payload)
+    claims_sha256 = sha256_hex(claims_payload)
+    primary_claim = next((c for c in claim_list
+                          if c["kind"] == "primary_effect"), None)
+
+    # --- deterministic figures (stdlib SVG) -----------------------------------
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    fig_sha: dict[str, str] = {}
+    for name, svg in figures.build_figures(records, boot).items():
+        atomic_write_text(figures_dir / name, svg)
+        fig_sha[name] = sha256_hex(svg)
+
+    # --- deterministic report.md (numerals trace only to claims) --------------
+    report_meta = {
+        "contract_id": contract.contract_id,
+        "campaign_id": state.get("campaign_id"),
+        "baseline_commit_short": (baseline_commit or "")[:12],
+        "incumbent_commit_short": (incumbent_commit or "")[:12],
+        "report_date": report_ts[:10],
+        "fig_paired": "test_paired_rmse.svg",
+        "fig_trajectory": "dev_trajectory.svg",
+        "fig_verdicts": "verdict_mix.svg",
+    }
+    report_md_text = report_md.render_report(claim_list, report_meta)
+    atomic_write_text(report_dir / "report.md", report_md_text)
+    report_md_sha256 = sha256_hex(report_md_text)
+
+    # --- cross-model review (opt-in, advisory; never blocks the report) -------
+    review = reviewer.skipped_review(args.model or contract.reviewer.model)
+    review_sha256 = None
+    if getattr(args, "reviewer", "none") == "codex" and contract.reviewer.enabled:
+        token = secrets.token_hex(8)
+        review_dir = report_dir / "review" / request_id
+        raw_test = _reviewer_raw_test(baseline_metrics, incumbent_metrics, boot)
+        cited = sorted({eid for r in experiments
+                        if r.get("decision") == "accept"
+                        for eid in (r.get("hypothesis") or {}).get(
+                            "supporting_evidence_ids") or []})
+        evidence_records = [evidence_index[e] for e in cited
+                            if e in evidence_index]
+        diffs = []
+        for r in experiments:
+            if r.get("decision") == "accept" and r.get("commit"):
+                d = git.run("diff", f"{r.get('base_commit')}..{r.get('commit')}",
+                            check=False).stdout[:16000]
+                diffs.append({"run_id": r.get("run_id"), "diff": d})
+        packet = reviewer.build_reviewer_packet(
+            contract_meta=meta, claims=claim_list,
+            report_md_text=report_md_text, raw_test=raw_test,
+            evidence_records=evidence_records, diffs=diffs, echo_token=token)
+        review = reviewer.run_review(
+            packet=packet, model=args.model or contract.reviewer.model,
+            timeout_s=contract.reviewer.timeout_s, workdir=review_dir,
+            echo_token=token,
+            max_prompt_bytes=contract.reviewer.max_prompt_bytes,
+            env=reviewer.build_codex_env(os.environ),
+            expected_claim_ids=[c["claim_id"] for c in claim_list],
+            runner=subprocess.run,
+            warn=lambda m: print(f"WARN: {m}", file=sys.stderr))
+        atomic_write_json(review_dir / "review.json", review)
+        atomic_write_text(review_dir / "review.md",
+                          reviewer.render_review_md(review))
+        review_sha256 = sha256_file(review_dir / "review.json")
+        append_jsonl(LEDGER_PATH, {
+            "record_type": "review", "timestamp_utc": utc_now(),
+            "campaign_id": state.get("campaign_id"),
+            "status": review["status"], "overall": review["overall"],
+            "review_path": str(review_dir / "review.json"),
+            "review_sha256": review_sha256, "claims_sha256": claims_sha256})
+
+    # --- seal the final_report record -----------------------------------------
+    per_seed = [{
+        "seed_index": s.seed_index, "baseline": s.rmse_baseline,
+        "incumbent": s.rmse_incumbent, "delta": s.delta,
+        "failure_baseline": s.failure_baseline,
+        "failure_incumbent": s.failure_incumbent} for s in boot.per_seed]
+    report = {
+        "record_type": "final_report", "timestamp_utc": report_ts,
+        "campaign_id": state.get("campaign_id"), "request_id": request_id,
+        "contract_id": contract.contract_id,
+        "contract_sha256": sha256_file(CONTRACT_PATH),
+        "evaluator_sha256": sha256_file(EVALUATOR_PATH),
+        "baseline_commit": baseline_commit, "incumbent_commit": incumbent_commit,
+        "test": {
+            "baseline_pooled": boot.rmse_baseline_pooled,
+            "incumbent_pooled": boot.rmse_incumbent_pooled,
+            "effect_abs": boot.effect_abs,
+            "relative_improvement": boot.effect_rel,
+            "per_seed": per_seed, "clean": boot.clean},
+        "ci": {"abs": list(boot.ci_abs) if boot.ci_abs else None,
+               "rel": list(boot.ci_rel) if boot.ci_rel else None,
+               "confidence": boot.confidence, "resamples": boot.resamples,
+               "bootstrap_seed": boot.bootstrap_seed,
+               "seed_consistency": boot.seed_consistency},
+        "dev": {"baseline": state.get("baseline_primary"),
+                "incumbent": state.get("best_primary")},
+        "multiple_testing_disclosure": disclosure,
+        "selection_rule": gates[-1].get("selection_rule") if gates else None,
+        "stop_state": {"stagnation": state.get("stagnation"),
+                       "round": state.get("round")},
+        "literature": {
+            "corpus_id": bundles[-1].get("corpus_id") if bundles else None,
+            "corpus_sha256": bundles[-1].get("corpus_sha256") if bundles else None,
+            "grounding_events": len(bundles),
+            "evidence_records": len(evidence_index),
+            "contradictions_surfaced": len({
+                json.dumps(c, sort_keys=True)
+                for b in bundles for c in b.get("contradictions") or []}),
+            "evidence_audit": audit} if bundles else None,
+        "costs": costs,
+        "claims_sha256": claims_sha256, "claims_count": len(claim_list),
+        "primary_claim_id": primary_claim["claim_id"] if primary_claim else None,
+        "primary_status": primary_claim["status"] if primary_claim else None,
+        "report_md_sha256": report_md_sha256, "figures": fig_sha,
+        "review": {"status": review["status"], "overall": review["overall"],
+                   "review_sha256": review_sha256},
+    }
     append_jsonl(LEDGER_PATH, report)
     atomic_write_json(report_dir / "report.json", report)
     print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_approve(args: argparse.Namespace) -> int:
+    """Approve or deny a pending report-intent request (human gate, Layer 9).
+
+    A pure ledger append. It does NOT re-check fingerprint freshness — that is
+    cmd_report's job at report time, so an approval that goes stale after a
+    later `run` is caught there. A later decision supersedes an earlier one for
+    the same request (an explicit escape hatch after a deny)."""
+    state = load_state()
+    records = read_jsonl(LEDGER_PATH)
+    req = gate.find_request(records, args.request_id)
+    if req is None:
+        raise OrchestratorError(
+            f"no approval_request matching {args.request_id!r}")
+    rid = req["request_id"]
+    decision = "deny" if args.deny else "approve"
+    existing = gate.decision_for(records, rid)
+    if existing is not None and existing.get("decision") == decision:
+        print(f"request {rid} already {decision}d — no change")
+        return 0
+    dec = gate.make_decision(state.get("campaign_id"), rid, decision,
+                             args.reason, utc_now())
+    append_jsonl(LEDGER_PATH, dec)
+    print(f"{decision} recorded for request_id {rid}")
     return 0
 
 
@@ -4133,7 +4584,26 @@ def main() -> int:
     p_report.add_argument("--force", action="store_true",
                           help="re-run despite an existing report (counted "
                                "in the multiple-testing disclosure)")
+    p_report.add_argument("--reviewer", choices=("none", "codex"),
+                          default="none",
+                          help="cross-model adversarial review of the claims "
+                               "(codex = different model family, opt-in and "
+                               "advisory; requires reviewer.enabled)")
+    p_report.add_argument("--model", default=None,
+                          help="model override for the codex reviewer")
     p_report.set_defaults(fn=cmd_report)
+
+    p_approve = sub.add_parser(
+        "approve", help="approve/deny a pending report request (human gate)")
+    p_approve.add_argument("request_id",
+                           help="request_id printed by `report` (exit 3); a "
+                                "unique prefix is accepted")
+    p_approve.add_argument("--deny", action="store_true",
+                           help="deny instead of approve")
+    p_approve.add_argument("--reason", default=None,
+                           help="optional free-text reason recorded in the "
+                                "decision")
+    p_approve.set_defaults(fn=cmd_approve)
 
     p_ground = sub.add_parser("ground",
                               help="one-shot research-question grounding "
@@ -4150,7 +4620,7 @@ def main() -> int:
 
     args = parser.parse_args()
     try:
-        if args.command in ("init", "run", "report", "ground"):
+        if args.command in ("init", "run", "report", "ground", "approve"):
             with InstanceLock(LOCK_PATH):
                 return args.fn(args)
         return args.fn(args)

@@ -10,8 +10,8 @@
 # To intentionally change the contract: stop all runs, `chmod u+w` the file,
 # edit, then re-run `orchestrator.py init --force` to rebuild the manifest.
 # =============================================================================
-schema_version: 4
-contract_id: autoresearch-phase4-refinement
+schema_version: 5
+contract_id: autoresearch-phase5-assurance
 
 objective: >
   Minimize held-out RMSE of the model trained by src/train.py. Interventions
@@ -48,6 +48,12 @@ protected_globs:
   # would be an integrity hole in the trusted path; a mutable corpus would
   # let evidence drift mid-campaign (citation fraud).
   - "literature/**"
+  # Phase 5: the assurance package computes claims, confidence intervals and
+  # the report — scientific provenance. The orchestrator imports it, so (like
+  # literature/**) it must live on the trusted path: a coder that could edit
+  # the bootstrap or the claim validator could launder results past the
+  # reviewer. It performs no runtime writes (all IO stays in the orchestrator).
+  - "assurance/**"
 
 budgets:
   # Must match the hardcoded values in evaluation/evaluate.py; the evaluator
@@ -147,7 +153,46 @@ pairwise_gate:
   judges: 3
   # Kept distinct from the proposer/coder model on purpose (ARIS: judges
   # from a different model family — approximated within the Claude family;
-  # the true cross-family reviewer is Phase 5).
+  # the true cross-family reviewer is the Phase 5 `reviewer:` block below).
   judge_model: claude-haiku-4-5
   judge_max_budget_usd: 0.4
   judge_max_campaign_budget_usd: null
+
+assurance:
+  # Phase 5 scientific assurance (Blueprint Layer 8). The finalist is
+  # reproduced on `finalist_seeds` hidden test seeds (the seed VALUES live in
+  # the git-untracked evaluation/heldout_config.json; only the COUNT is here),
+  # and the incumbent-vs-baseline effect gets a paired-example bootstrap
+  # confidence interval. All statistics are pure-stdlib and byte-deterministic:
+  # the bootstrap RNG seed is derived from the campaign/commit ids and logged,
+  # so a report is reproducible from the immutable ledger + metrics files.
+  finalist_seeds: 5
+  bootstrap_resamples: 10000
+  confidence_level: 0.95
+
+reviewer:
+  # Phase 5 cross-model adversarial reviewer (ARIS). A DIFFERENT model family
+  # from the Claude executor/proposer/judge audits each claim's numbers against
+  # the raw per-seed test data. Opt-in per run (`report --reviewer codex`) AND
+  # gated by `enabled` here. The reviewer is advisory: any failure records
+  # status "unavailable" and never blocks the report, and it NEVER falls back
+  # to a Claude reviewer (that would defeat the cross-family purpose). Its
+  # output is non-deterministic and confined to experiments/report/review/.
+  enabled: false
+  backend: codex
+  # Model pin passed to `codex exec -m`; null uses codex's configured default.
+  model: null
+  timeout_s: 300
+  max_prompt_bytes: 200000
+
+human_gate:
+  # Phase 5 human approval gate (Blueprint Layer 9). The single-use test split
+  # is a publication-analog: the first `report` (and every `report --force`
+  # re-run) requires a human to approve the INTENT — commits, dev numbers, seed
+  # plan, disclosure-so-far — BEFORE any test number is computed. Approval
+  # state is derived from the ledger (approval_request/approval_decision
+  # records), never persisted in state.json. Interior operations (coder runs,
+  # budget raises) are deliberately NOT gated, to avoid gate-fatigue that would
+  # train the human to rubber-stamp the one irreversible decision that matters.
+  enabled: true
+  require_approval_for: [first_report, force_report]
