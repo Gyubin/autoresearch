@@ -1565,7 +1565,7 @@ class ClaudeProposer:
             items = raw.get("hypotheses")
             if not isinstance(items, list):
                 feedback = "missing hypotheses array"
-                continue
+                continue  # kept_batch, if any, is returned at loop exit below
             batch: list[Hypothesis] = []
             seen_params: set[str] = set()
             coder_count = 0
@@ -1602,6 +1602,12 @@ class ClaudeProposer:
             if kept_batch:
                 return kept_batch  # soft retry produced nothing valid
             feedback = "; ".join(errors) or "no valid items"
+        # Every give-up path (non-list retry, malformed retry, retry with no
+        # valid items) reaches here: never discard a batch already held from
+        # the soft diversity retry — that would turn the diversity retry into
+        # the LEAST diverse outcome (a full heuristic fallback).
+        if kept_batch:
+            return kept_batch
         raise ProposerError(f"Claude proposer produced no valid batch: {feedback}")
 
 
@@ -2333,13 +2339,19 @@ def extract_update_vectors(records: list[dict], *,
     for r in records:
         if r.get("record_type") != "experiment" or r.get("verdict") == "aborted":
             continue
+        if r.get("run_id") in corrected:
+            # A rolled-back accept (ff-merge failed / recovery diverged) has
+            # no scientific standing — rebuild_insights and replay_ledger_
+            # fields both drop it entirely, so momentum must too. Flipping
+            # only the decision would still leave +0.4 (valid_positive
+            # non-accept), biasing steering toward a direction whose gain was
+            # reverted.
+            continue
         hyp = r.get("hypothesis") or {}
         intervention = hyp.get("intervention") or {}
         param = intervention.get("param")
         frm, to = intervention.get("from"), intervention.get("to")
         decision = r.get("decision")
-        if r.get("run_id") in corrected and decision == "accept":
-            decision = "reject"  # accept that never landed: no momentum
         before, primary = r.get("best_primary_before"), r.get("primary")
         delta_rel = None
         if (isinstance(before, (int, float)) and isinstance(primary, (int, float))
@@ -3073,6 +3085,12 @@ def _select_gate_winner(ctx: LoopContext, gate_record: dict,
                       "judges": ctx.judge.cfg.judges, "pairs": [],
                       "fallback_reason": None}
     gate_record["pairwise"] = pairwise
+    # The judge instance persists across generations within one run, so
+    # total_cost_usd is a lifetime accumulator; record only THIS gate's
+    # delta. Otherwise _judge_campaign_spend would sum prefix sums
+    # (quadratic overcount) and the value would be inconsistent across a
+    # process restart that resets the accumulator.
+    spend_before = ctx.judge.total_cost_usd
     try:
         diffs = {r["run_id"]: _candidate_diff(ctx, r, base_commit)
                  for r in ordered}
@@ -3089,20 +3107,22 @@ def _select_gate_winner(ctx: LoopContext, gate_record: dict,
             elif pair["consensus"] is None:
                 # Abstention / no majority: no basis to override scalar.
                 pairwise["fallback_reason"] = "no judge majority"
-                pairwise["cost_usd"] = round(ctx.judge.total_cost_usd, 6)
+                pairwise["cost_usd"] = round(
+                    ctx.judge.total_cost_usd - spend_before, 6)
                 gate_record["reason"] = (
                     "admitted on the gate split; pairwise inconclusive, "
                     "scalar selection used")
                 return scalar_winner
     except Exception as exc:  # SDK / network / invalid verdict
         pairwise["fallback_reason"] = f"judge error: {exc}"
-        pairwise["cost_usd"] = round(ctx.judge.total_cost_usd, 6)
+        pairwise["cost_usd"] = round(
+            ctx.judge.total_cost_usd - spend_before, 6)
         gate_record["reason"] = (
             "admitted on the gate split; pairwise judge failed, scalar "
             "selection used")
         return scalar_winner
 
-    pairwise["cost_usd"] = round(ctx.judge.total_cost_usd, 6)
+    pairwise["cost_usd"] = round(ctx.judge.total_cost_usd - spend_before, 6)
     gate_record["reason"] = (
         "admitted on the gate split; selected by blind pairwise majority"
         if champion["run_id"] != scalar_winner else

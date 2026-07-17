@@ -152,13 +152,21 @@ def test_momentum_fold() -> None:
 # ---------------------------------------------------------------------------
 
 def test_momentum_exceptions() -> None:
+    # A corrected (rolled-back) accept must be FULLY excluded from momentum,
+    # exactly as rebuild_insights and replay_ledger_fields exclude it — not
+    # merely demoted to a gate-rejected +0.4, which would keep biasing
+    # steering toward a direction whose gain was reverted.
     with_corr = LEDGER_FIXTURE + [
         {"record_type": "correction", "corrects": "r0005",
          "reason": "ff-merge failed"}]
-    table = momentum_of(with_corr)
-    lr = table.get("lr:increase") or {}
-    check("momentum: corrected accept demotes to gate-rejected weight",
-          lr.get("score") == 0.9 and lr.get("consecutive_accepts") == 0,
+    corr_table = momentum_of(with_corr)
+    without_r0005 = [r for r in LEDGER_FIXTURE if r.get("run_id") != "r0005"]
+    check("momentum: corrected accept excluded == ledger without that run",
+          json.dumps(corr_table, sort_keys=True)
+          == json.dumps(momentum_of(without_r0005), sort_keys=True))
+    lr = corr_table.get("lr:increase") or {}
+    check("momentum: rolled-back lr accept leaves only gen-1's decayed score",
+          lr.get("score") == 0.5 and lr.get("consecutive_accepts") == 1,
           json.dumps(lr))
 
     legacy = [exp("r0001", None, "lr", 0.005, 0.0125, "valid_positive",
@@ -691,6 +699,37 @@ def test_pairwise_selection() -> None:
         orch._sdk_structured_query = orig
 
 
+def test_pairwise_cost_per_gate_delta() -> None:
+    # The judge instance persists across generations within a run; each gate
+    # record must store only ITS OWN spend, not the lifetime accumulator —
+    # else _judge_campaign_spend sums prefix sums (quadratic overcount).
+    pm = orch.load_contract().primary_metric
+    admitted = [_cand("r0001", 0.30, "raise lr"),
+                _cand("r0002", 0.31, "add interaction WINNER_MARK")]
+    orig = orch._sdk_structured_query
+    try:
+        orch._sdk_structured_query = _prefer_marker("WINNER_MARK")
+        judge = orch.PairwiseJudge(_judge_cfg())  # ONE judge, reused
+        ctx = _fake_ctx(judge)
+        per_gate = judge.cfg.judges * 0.01  # one pair, judges votes @ $0.01
+        gate_records = []
+        for _ in range(3):  # three generations, same judge
+            gr = _gate_record()
+            orch._select_gate_winner(ctx, gr, admitted, pm, "base", 1)
+            gate_records.append(gr)
+        deltas = [gr["pairwise"]["cost_usd"] for gr in gate_records]
+        check("pairwise: each gate records only its own judge spend (delta)",
+              all(abs(d - per_gate) < 1e-9 for d in deltas),
+              json.dumps(deltas))
+        check("pairwise: campaign spend sums to the true total, not prefix sums",
+              abs(orch._judge_campaign_spend(gate_records) - 3 * per_gate)
+              < 1e-9)
+        check("pairwise: accumulator kept growing (delta is not the raw field)",
+              abs(judge.total_cost_usd - 3 * per_gate) < 1e-9)
+    finally:
+        orch._sdk_structured_query = orig
+
+
 def test_pairwise_budget_and_spend() -> None:
     ledger = [
         {"record_type": "gate", "pairwise": {"cost_usd": 0.6}},
@@ -722,6 +761,81 @@ def test_pairwise_budget_and_spend() -> None:
     finally:
         orch._sdk_structured_query = orig_query
         orch.LEDGER_PATH = orig_ledger
+
+
+# ---------------------------------------------------------------------------
+# S6 — ClaudeProposer soft-explore retry never discards a held valid batch
+# ---------------------------------------------------------------------------
+
+def _valid_lr_batch() -> dict:
+    return {"hypotheses": [{
+        "statement": "raise lr", "mechanism": "step size", "executor": "patcher",
+        "param": "lr", "new_value": 0.0125, "implementation_brief": None,
+        "predicted_effect": "improves", "falsifier": "no improvement",
+        "supporting_evidence_ids": []}]}
+
+
+def _seq_query(*responses):
+    """Fake _sdk_structured_query returning one response per call; an
+    Exception instance is raised instead of returned."""
+    state = {"i": 0}
+
+    def _q(prompt, schema, *, model, max_budget_usd, system_prompt):
+        r = responses[min(state["i"], len(responses) - 1)]
+        state["i"] += 1
+        if isinstance(r, Exception):
+            raise r
+        return r, 0.0
+    return _q
+
+
+def test_soft_retry_preserves_batch() -> None:
+    contract = orch.load_contract()
+    # momentum so the first (all-lr-increase) batch looks fully exploited,
+    # which triggers the one-shot diversity retry that holds kept_batch.
+    momentum = {"lr:increase": {"param": "lr", "move": "increase",
+                                "score": 2.0, "last_outcome": "accepted",
+                                "last_generation": 1, "boundary_to": None,
+                                "consecutive_accepts": 1,
+                                "evidence_run_ids": ["r0001"]}}
+
+    def held_batch_survives(second, label):
+        ctx = make_ctx(contract, momentum=momentum,
+                       refinement=make_refinement())
+        orig = orch._sdk_structured_query
+        try:
+            orch._sdk_structured_query = _seq_query(_valid_lr_batch(), second)
+            batch = orch.ClaudeProposer(max_budget_usd=0.1).propose_batch(ctx, 1)
+            check(f"soft-retry: held batch returned when retry {label}",
+                  len(batch) == 1
+                  and batch[0].intervention["param"] == "lr")
+        except orch.ProposerError:
+            check(f"soft-retry: held batch returned when retry {label}", False,
+                  "raised ProposerError instead of returning kept_batch")
+        finally:
+            orch._sdk_structured_query = orig
+
+    held_batch_survives({}, "is malformed (no hypotheses list)")   # 1566 path
+    held_batch_survives({"hypotheses": [{"executor": "patcher",
+                                         "param": "nope"}]},
+                        "yields only invalid items")               # 1605 path
+    held_batch_survives(RuntimeError("SDK down"), "raises")        # except path
+
+    # Sanity: with NO momentum the diversity retry never fires, so a genuinely
+    # unusable single response still raises (kept_batch stays empty).
+    ctx = make_ctx(contract, refinement=make_refinement())  # momentum empty
+    orig = orch._sdk_structured_query
+    try:
+        orch._sdk_structured_query = _seq_query({}, {})
+        raised = False
+        try:
+            orch.ClaudeProposer(max_budget_usd=0.1).propose_batch(ctx, 1)
+        except orch.ProposerError:
+            raised = True
+        check("soft-retry: still raises when there was never a valid batch",
+              raised)
+    finally:
+        orch._sdk_structured_query = orig
 
 
 # ---------------------------------------------------------------------------
@@ -810,12 +924,14 @@ def main() -> int:
         test_legacy_equivalence()
         test_value_progression()
         test_explore_slots()
+        test_soft_retry_preserves_batch()
         test_halving_cut()
         test_pruned_semantics()
         test_pairwise_packet_blindness()
         test_pairwise_injection_defense()
         test_pairwise_consensus()
         test_pairwise_selection()
+        test_pairwise_cost_per_gate_delta()
         test_pairwise_budget_and_spend()
         test_contract_v4(tmp)
 
