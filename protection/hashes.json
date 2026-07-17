@@ -1,14 +1,17 @@
 {
   "algorithm": "sha256",
-  "created_utc": "2026-07-17T02:50:45.032638+00:00",
+  "created_utc": "2026-07-17T12:22:00.858991+00:00",
   "files": {
     ".python-version": "a876e0b10411037a012498b9fe18d9bc1df32ed8b722a13564dc944ddcfd9135",
     "evaluation/dataset.py": "5ee4648b70995615bcb48d2b67ef047879044b2121aa812e2dade0d0b3a9bc0e",
     "evaluation/evaluate.py": "dd4fabbc346a9cde924eb166224e3b7874c711946d819491803ff90870ec87f2",
-    "evaluation/heldout_config.json": "586921fdd6c84e465056c8feddf48d381e3c643ff424b03e188950ad116c8e17",
-    "orchestrator.py": "c297a3a453a14611ed377cfa6a44def2ed1afc3c9f14d43e1a75151a2e5fc6a9",
+    "evaluation/heldout_config.json": "e18950a921cd8496df7656e1dc408f83f4fd7b65c4c439750d8fe22c0d239e49",
+    "literature/__init__.py": "72369fb2196e261e6907ddbbe91c869402955c9249e3b6ba544477cc9681ba0b",
+    "literature/corpus/mock_corpus.json": "b697afbb13bf3efa7ebd80aa01db6401bd7aaa43257d9dc87c8027c0a376993e",
+    "literature/engine.py": "a20d72ce21f896cf88a0994934b38b4e03f76d1ae415b583465f48567861727e",
+    "orchestrator.py": "ca42eab669933fe48bcf2a20067f53b9efa0c12968d12f2233e40961d7ff231c",
     "pyproject.toml": "22b03084ceb9648ae46bdebc5f1833da3dc16e06b22e28fef952e82ebbd8dec1",
-    "research_contract.yaml": "11bb64e92bf134e01e7708a5497560590261f8b4a0bc9df575a7a8911b72af6a",
+    "research_contract.yaml": "6c16c67417c6daf55e9df44f14b5001504764dd83f47dda9c7e0cf3ff958e0f4",
     "uv.lock": "8e9fae89b8b6b8221ea66d380d83e64765f9e87aa386deb46ec341eb277a94f1"
   },
   "protected_globs": [
@@ -18,6 +21,7 @@
     "protection/**",
     "pyproject.toml",
     "uv.lock",
-    ".python-version"
+    ".python-version",
+    "literature/**"
   ]
 }
