@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256",
-  "created_utc": "2026-07-17T19:31:21.646746+00:00",
+  "created_utc": "2026-07-17T20:37:15.760202+00:00",
   "files": {
     ".python-version": "a876e0b10411037a012498b9fe18d9bc1df32ed8b722a13564dc944ddcfd9135",
     "assurance/__init__.py": "e12ffeca38e9ee8d0db9f257891ad8470592564f04365ef9820e10836f1cdee4",
@@ -13,14 +13,16 @@
     "assurance/stats.py": "0744cb2f90444d372c5c8bf55eeb38cb1eee305afbd6f627ea53d70ed058d281",
     "assurance/svgfig.py": "54f601aacc57008bb4828af4c553080253f0feac1804ae8fe9455d35a9b12014",
     "evaluation/dataset.py": "2d6aae8bc9a65cc162b1157bb163fc52ac9e4cfd66fe6c6a47227aa495f5658f",
-    "evaluation/evaluate.py": "cb5e855fdfb8af17641ea91179044d04458cb78701f18fa04a90bf5e5b7957cf",
-    "evaluation/heldout_config.json": "17f0b1dc2d0d0013b13e6345792a33645683a8aba3f7cf41e60016888cb01ef2",
+    "evaluation/evaluate.py": "c9cff3ae5e3a4ef5f45b4e3ad1d8fb93de678b2a9942eddbdbc648fe8b587449",
+    "evaluation/heldout_config.json": "d2f35b117f8aafc5ecec169f322a04b2bb5a31b038b134e7253371de9ba493b8",
     "literature/__init__.py": "72369fb2196e261e6907ddbbe91c869402955c9249e3b6ba544477cc9681ba0b",
     "literature/corpus/mock_corpus.json": "b697afbb13bf3efa7ebd80aa01db6401bd7aaa43257d9dc87c8027c0a376993e",
     "literature/engine.py": "9f352d5ef85cf3d7edfab2ff6b8f54eb69ae4ffba8124753b1c869e4fc55a816",
-    "orchestrator.py": "15d5d6d3741432daba875d274bffab65b453d86fc78ec27895d6002d95c6d016",
+    "orchestrator.py": "9ca60a9b0447471324eaf235c7185ba85b5354481df43b0592beabf699a6ff53",
     "pyproject.toml": "22b03084ceb9648ae46bdebc5f1833da3dc16e06b22e28fef952e82ebbd8dec1",
-    "research_contract.yaml": "e999b7a003b6bb0714a749fa2e3e6e5b8320d95931f0cdd902fd6ff418bfb0e5",
+    "research_contract.yaml": "7636f55d08dea46be4fcd7322fc1874f445f469f8fb637db29d21583aec5b8ef",
+    "sandbox/__init__.py": "6c48f135f0e7096b0de457773f68125465bf6db4fe977232e657cec5dd5225b4",
+    "sandbox/runner.py": "d210038babc3990140187625a470a1b5122280c00cc3067d40aaf9d3146be6d2",
     "uv.lock": "8e9fae89b8b6b8221ea66d380d83e64765f9e87aa386deb46ec341eb277a94f1"
   },
   "protected_globs": [
@@ -32,6 +34,7 @@
     "uv.lock",
     ".python-version",
     "literature/**",
-    "assurance/**"
+    "assurance/**",
+    "sandbox/**"
   ]
 }
