@@ -171,6 +171,18 @@ def test_container_masking(tmp: Path) -> None:
           and str(ROOT / "evaluation" / "heldout_config.json") not in joined)
 
 
+def test_container_paths_absolute() -> None:
+    # Docker -v sources must be absolute; relative bind sources become named
+    # volumes and fail. docker_argv must resolve every bind source.
+    con = sbx.ContainerSandbox(_cfg())
+    argv = con.docker_argv(Path("rel/ws"), {"PYTHONHASHSEED": "0"},
+                           Path("rel/art"), Path("rel/mask"), "ar-x")
+    sources = [argv[i + 1].split(":")[0] for i, a in enumerate(argv) if a == "-v"]
+    check("paths: all -v bind sources are absolute", bool(sources)
+          and all(s.startswith("/") for s in sources),
+          f"non-absolute: {[s for s in sources if not s.startswith('/')]}")
+
+
 def test_container_infra_error(tmp: Path) -> None:
     # docker/OCI launch failures (125/126/127) are infra, not a candidate fault.
     for code in (125, 126, 127):
@@ -355,6 +367,7 @@ def main() -> int:
         test_subprocess_regression(tmp)
         test_container_argv_hardening(tmp)
         test_container_masking(tmp)
+        test_container_paths_absolute()
         test_container_infra_error(tmp)
         test_container_timeout_teardown(tmp)
         test_preflight_fail_closed()

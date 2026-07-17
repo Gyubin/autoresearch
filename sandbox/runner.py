@@ -171,6 +171,12 @@ class ContainerSandbox:
                     container_name: str) -> list[str]:
         c = self._cfg
         wd = self._workdir
+        # Docker `-v` sources must be ABSOLUTE host paths — a relative path is
+        # silently read as a named-volume reference and fails. Resolve every
+        # bind source so a relative workspace/out path can never slip through.
+        workspace = workspace.resolve()
+        host_artifacts = host_artifacts.resolve()
+        mask_file = mask_file.resolve()
         argv = [
             "docker", "run", "--rm", "--init", "--name", container_name,
             "--network", "none",                       # no exfiltration/phone-home
