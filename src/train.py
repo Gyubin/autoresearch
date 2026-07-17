@@ -41,7 +41,7 @@ HYPERPARAMS = {
     "momentum": 0.0,
     "l2": 0.0,
     "batch_size": 32,
-    "feature_scaling": False,
+    "feature_scaling": True,
 }
 # --- HYPERPARAMS-END ---
 
