@@ -18,6 +18,17 @@ Trust model / invariants:
         workspace;
       - dataset code is loaded from THIS directory by absolute file path, so
         workspace code can never enter the evaluator's import path.
+  * Phase 6a (Blueprint Layer 5): the candidate trainer's EXECUTION is
+    delegated to a sandbox (sandbox/runner.py, loaded from THIS repo by
+    absolute file path, never via sys.path). The default `subprocess` backend
+    is the historical host subprocess (no OS isolation); the `container`
+    backend runs train.py under `docker run` with no network, a read-only
+    rootfs, dropped capabilities, resource limits, an ephemeral PID namespace,
+    and the held-out seed file masked out of the mount. SCORING never enters
+    the sandbox — the seeds stay in this trusted process only — so isolated
+    candidate code cannot read them regardless of the workspace path. The
+    backend/limits arrive as CLI flags from the (trusted) orchestrator and are
+    echoed back into metrics for provenance and drift detection.
   * The train subprocess gets a from-scratch environment (PATH,
     PYTHONHASHSEED=0, optional AUTORESEARCH_SMOKE) and `-s -B` flags. The
     orchestrator's --nonce is echoed into metrics but never exported to the
@@ -42,7 +53,6 @@ import json
 import math
 import os
 import platform
-import signal
 import subprocess
 import sys
 import time
@@ -65,6 +75,11 @@ SPLIT_NAMES = ("dev", "gate", "test")
 # cross-checks the two (and that finalist_seeds <= this bound) and fails fast
 # on drift. It also bounds the per-invocation seed index the evaluator honors.
 MAX_TEST_SEEDS = 16
+
+# Phase 6a: execution-sandbox backends this evaluator will honor. Must equal
+# SUPPORTED_BACKENDS in sandbox/runner.py; `orchestrator.py init` cross-checks
+# this declaration against the contract's chosen backend and fails on drift.
+SUPPORTED_SANDBOX_BACKENDS = ("subprocess", "container")
 
 MAX_ARTIFACT_BYTES = 1_000_000
 TAIL_BYTES = 2048
@@ -99,6 +114,31 @@ def _load_dataset_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+_SANDBOX_MODULE = None
+
+
+def _load_sandbox_module():
+    """Load the ROOT sandbox runner by absolute path (never via sys.path), so a
+    workspace copy can never shadow the isolation code. Cached: one evaluator
+    process runs a single evaluation, but the config build and the run share it
+    (identical SandboxConfig class)."""
+    global _SANDBOX_MODULE
+    if _SANDBOX_MODULE is None:
+        spec = importlib.util.spec_from_file_location(
+            "autoresearch_root_sandbox", EVAL_DIR.parent / "sandbox" / "runner.py"
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("failed to build import spec for sandbox/runner.py")
+        module = importlib.util.module_from_spec(spec)
+        # Register before exec: @dataclasses.dataclass (Py 3.14) resolves the
+        # class module via sys.modules during processing, so an unregistered
+        # module raises AttributeError.
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _SANDBOX_MODULE = module
+    return _SANDBOX_MODULE
 
 
 def _tail(path: Path) -> str:
@@ -141,13 +181,14 @@ def _workspace_commit(workspace: Path) -> str | None:
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
-def _run_train(
-    workspace: Path, mode: str, log_dir: Path
-) -> tuple[int | None, bool, Path, Path]:
-    """Run the candidate trainer. Returns (exit_code, timed_out, stdout, stderr)."""
-    stdout_path = log_dir / f"train_stdout_{mode}.log"
-    stderr_path = log_dir / f"train_stderr_{mode}.log"
+def _run_train(workspace: Path, mode: str, log_dir: Path, sandbox_cfg,
+               run_id: str, split: str, seed_index: int | None):
+    """Run the candidate trainer via the configured sandbox.
 
+    The evaluator remains the sole authority on the from-scratch environment;
+    the sandbox only decides HOW that command is isolated. Returns the
+    sandbox's TrainResult (exit_code, timed_out, stdout/stderr paths,
+    artifacts_dir, isolated, backend, infra_error)."""
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "PYTHONHASHSEED": "0",
@@ -155,33 +196,21 @@ def _run_train(
     if mode == "smoke":
         env["AUTORESEARCH_SMOKE"] = "1"
 
-    cmd = [sys.executable, "-s", "-B", str(workspace / "src" / "train.py")]
-    with open(stdout_path, "wb") as f_out, open(stderr_path, "wb") as f_err:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=workspace,
-            env=env,
-            stdout=f_out,
-            stderr=f_err,
-            start_new_session=True,
-        )
-        try:
-            exit_code = proc.wait(timeout=TRAIN_TIMEOUT_S[mode])
-            timed_out = False
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            proc.wait()
-            exit_code = None
-            timed_out = True
-    return exit_code, timed_out, stdout_path, stderr_path
+    sandbox_mod = _load_sandbox_module()
+    sandbox = sandbox_mod.build_sandbox(sandbox_cfg)
+    seed_tag = f"-s{seed_index}" if seed_index is not None else ""
+    name_hint = f"{run_id}-{split}{seed_tag}"
+    return sandbox.run_train(workspace, mode, env, TRAIN_TIMEOUT_S[mode],
+                             log_dir, name_hint)
 
 
-def _load_artifact(workspace: Path, notes: list[str]) -> tuple[dict | None, str | None]:
-    """Validate and load artifacts/model.json. Returns (artifact, failure_class)."""
-    artifact_path = workspace / "artifacts" / "model.json"
+def _load_artifact(artifacts_dir: Path, notes: list[str]) -> tuple[dict | None, str | None]:
+    """Validate and load model.json from the sandbox's artifacts dir. Returns
+    (artifact, failure_class). For the subprocess backend this is
+    <workspace>/artifacts; for the container backend it is the fresh host dir
+    that was bind-mounted rw into the container (the seed-bearing repo tree is
+    never that dir)."""
+    artifact_path = artifacts_dir / "model.json"
     if artifact_path.is_symlink():
         notes.append("artifact is a symlink; rejected")
         return None, "malformed_artifact"
@@ -355,7 +384,7 @@ def _predict_sq_errors(
 
 
 def evaluate(workspace: Path, mode: str, split: str, run_id: str, nonce: str,
-             out_path: Path, seed_index: int | None = None) -> dict:
+             out_path: Path, sandbox_cfg, seed_index: int | None = None) -> dict:
     started = time.perf_counter()
     out_path.parent.mkdir(parents=True, exist_ok=True)  # log files land here too
     notes: list[str] = []
@@ -370,6 +399,13 @@ def evaluate(workspace: Path, mode: str, split: str, run_id: str, nonce: str,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "workspace": str(workspace),
         "workspace_commit": _workspace_commit(workspace),
+        # Phase 6a provenance: which isolation backend ran the candidate. The
+        # orchestrator echo-checks this against the backend it requested.
+        "sandbox": {
+            "backend": sandbox_cfg.backend,
+            "image": sandbox_cfg.image,
+            "isolated": sandbox_cfg.backend == "container",
+        },
         "executed": False,
         "degenerate": False,
         "failure_class": None,
@@ -414,17 +450,26 @@ def evaluate(workspace: Path, mode: str, split: str, run_id: str, nonce: str,
         return done()
 
     train_started = time.perf_counter()
-    exit_code, timed_out, stdout_path, stderr_path = _run_train(
-        workspace, mode, out_path.parent
-    )
+    train = _run_train(workspace, mode, out_path.parent, sandbox_cfg,
+                       run_id, split, seed_index)
     metrics["budget"]["train_seconds"] = round(time.perf_counter() - train_started, 3)
-    metrics["train_exit_code"] = exit_code
-    metrics["stdout_tail"] = _tail(stdout_path)
-    metrics["stderr_tail"] = _tail(stderr_path)
+    metrics["train_exit_code"] = train.exit_code
+    metrics["stdout_tail"] = _tail(train.stdout_path)
+    metrics["stderr_tail"] = _tail(train.stderr_path)
 
+    if train.infra_error:
+        # The sandbox itself failed to launch the container (docker/OCI exit
+        # 125/126/127) — an evaluator-infrastructure fault, not a candidate
+        # verdict. Raise so main() reports it loudly and exits nonzero; the
+        # orchestrator then treats the round as unscored, never a science result.
+        raise RuntimeError(
+            f"sandbox container failed to launch (docker exit "
+            f"{train.exit_code}); see stderr tail: {metrics['stderr_tail'][-500:]}")
+
+    exit_code, timed_out = train.exit_code, train.timed_out
     if timed_out:
         metrics["failure_class"] = "timeout"
-        notes.append(f"train exceeded {TRAIN_TIMEOUT_S[mode]}s; process group killed")
+        notes.append(f"train exceeded {TRAIN_TIMEOUT_S[mode]}s; sandbox torn down")
         return done()
     if exit_code != 0:
         metrics["failure_class"] = "nonzero_exit"
@@ -432,7 +477,7 @@ def evaluate(workspace: Path, mode: str, split: str, run_id: str, nonce: str,
 
     metrics["executed"] = True
 
-    artifact, failure = _load_artifact(workspace, notes)
+    artifact, failure = _load_artifact(train.artifacts_dir, notes)
     if failure or artifact is None:
         metrics["failure_class"] = failure or "malformed_artifact"
         return done()
@@ -542,6 +587,13 @@ def main() -> int:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--run-id", default="")
     parser.add_argument("--nonce", default="")
+    # Phase 6a execution sandbox. Passed by the trusted orchestrator from the
+    # contract's `sandbox` block; the evaluator honors only known backends.
+    parser.add_argument("--sandbox-backend", default="subprocess")
+    parser.add_argument("--sandbox-image", default=None)
+    parser.add_argument("--sandbox-memory-mb", type=int, default=512)
+    parser.add_argument("--sandbox-cpus", type=float, default=1.0)
+    parser.add_argument("--sandbox-pids", type=int, default=128)
     args = parser.parse_args()
 
     if args.mode == "smoke" and args.split != "dev":
@@ -552,11 +604,20 @@ def main() -> int:
         parser.error("--seed-index is only valid with --split test")
     if args.seed_index is not None and args.seed_index < 0:
         parser.error("--seed-index must be >= 0")
+    if args.sandbox_backend not in SUPPORTED_SANDBOX_BACKENDS:
+        parser.error(f"--sandbox-backend must be one of "
+                     f"{list(SUPPORTED_SANDBOX_BACKENDS)}")
+
+    sandbox_cfg = _load_sandbox_module().SandboxConfig(
+        backend=args.sandbox_backend, image=args.sandbox_image,
+        memory_mb=args.sandbox_memory_mb, cpus=args.sandbox_cpus,
+        pids_limit=args.sandbox_pids,
+    )
 
     try:
         metrics = evaluate(
             args.workspace.resolve(), args.mode, args.split, args.run_id,
-            args.nonce, args.out, seed_index=args.seed_index
+            args.nonce, args.out, sandbox_cfg, seed_index=args.seed_index
         )
     except Exception as exc:  # infra failure: report loudly, exit nonzero
         crash = {

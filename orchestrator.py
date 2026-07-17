@@ -73,6 +73,15 @@ from literature.engine import (ANTI_INJECTION_SENTENCE, CorpusError,
 from assurance import (claims as claims_builder, families, figures, gate,
                        report_md, reviewer, stats)
 
+# The execution sandbox (Phase 6a, Layer 5) is a separate, protected module:
+# stdlib-only, never imports the orchestrator. The evaluator loads it by
+# absolute path to isolate the untrusted trainer; the orchestrator imports the
+# config shape (reused as the contract's parsed `sandbox` block) plus the
+# fail-closed preflight. See sandbox/runner.py for the closure rules.
+from sandbox.runner import (SUPPORTED_BACKENDS as SUPPORTED_SANDBOX_BACKENDS,
+                            SandboxConfig, SandboxError)
+from sandbox.runner import preflight as sandbox_preflight
+
 # ---------------------------------------------------------------------------
 # Paths and constants
 # ---------------------------------------------------------------------------
@@ -388,6 +397,10 @@ class ResearchContract:
     assurance: Assurance
     reviewer: Reviewer
     human_gate: HumanGate
+    # Phase 6a (Layer 5): parsed `sandbox` block. The dataclass shape is reused
+    # from sandbox/runner.py so the orchestrator, evaluator and sandbox share a
+    # single config definition.
+    sandbox: SandboxConfig
 
 
 def _require(mapping: dict, key: str, kind: type | tuple, ctx: str) -> Any:
@@ -419,9 +432,9 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         raise ContractError("contract root must be a mapping")
 
     schema_version = _require(raw, "schema_version", int, "")
-    if schema_version != 5:
+    if schema_version != 6:
         raise ContractError(f"unsupported contract schema_version {schema_version} "
-                            f"(this orchestrator expects 5)")
+                            f"(this orchestrator expects 6)")
 
     # Top-level whitelist (new in v4): an unknown block would previously be
     # ignored silently, so a typo like `refinment:` could disable a whole
@@ -431,7 +444,8 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
                   "primary_metric", "secondary_metrics", "editable_globs",
                   "protected_globs", "budgets", "portfolio",
                   "stop_conditions", "literature", "refinement",
-                  "pairwise_gate", "assurance", "reviewer", "human_gate"}
+                  "pairwise_gate", "assurance", "reviewer", "human_gate",
+                  "sandbox"}
     unknown = sorted(set(raw) - known_keys)
     if unknown:
         raise ContractError(f"contract: unknown top-level keys {unknown}")
@@ -682,6 +696,36 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         require_approval_for=hg_ops,
     )
 
+    # Phase 6a sandbox block (Layer 5): execution isolation for the untrusted
+    # trainer. `subprocess` is the historical no-isolation default; `container`
+    # is OS isolation via docker. The image must be pinned when isolating.
+    sb_raw = _require(raw, "sandbox", dict, "")
+    sb_backend = _require(sb_raw, "backend", str, "sandbox")
+    if sb_backend not in SUPPORTED_SANDBOX_BACKENDS:
+        raise ContractError(
+            f"sandbox.backend {sb_backend!r} is not supported "
+            f"(have: {', '.join(SUPPORTED_SANDBOX_BACKENDS)})")
+    sb_image = sb_raw.get("image")
+    if sb_image is not None and (not isinstance(sb_image, str) or not sb_image.strip()):
+        raise ContractError("sandbox.image must be a non-empty string or null")
+    if sb_backend == "container" and not sb_image:
+        raise ContractError(
+            "sandbox.backend 'container' requires sandbox.image (pin by digest, "
+            "e.g. python:3.14-slim@sha256:...)")
+    sb_memory_mb = _require(sb_raw, "memory_mb", int, "sandbox")
+    sb_cpus = float(_require(sb_raw, "cpus", (int, float), "sandbox"))
+    sb_pids = _require(sb_raw, "pids_limit", int, "sandbox")
+    if sb_memory_mb < 64:
+        raise ContractError("sandbox.memory_mb must be >= 64")
+    if sb_cpus <= 0:
+        raise ContractError("sandbox.cpus must be positive")
+    if sb_pids < 1:
+        raise ContractError("sandbox.pids_limit must be >= 1")
+    sandbox = SandboxConfig(
+        backend=sb_backend, image=sb_image, memory_mb=sb_memory_mb,
+        cpus=sb_cpus, pids_limit=sb_pids,
+    )
+
     return ResearchContract(
         schema_version=schema_version,
         contract_id=_require(raw, "contract_id", str, ""),
@@ -703,6 +747,7 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         assurance=assurance,
         reviewer=reviewer,
         human_gate=human_gate,
+        sandbox=sandbox,
     )
 
 
@@ -2118,9 +2163,16 @@ def run_evaluator(guard: ProtectionGuard, workspace: Path, mode: str,
                   out_path: Path, run_id: str, timeout_s: int,
                   split: str = "dev", seed_index: int | None = None) -> dict:
     nonce = secrets.token_hex(16)
+    sb = guard.contract.sandbox
     cmd = [sys.executable, "-B", str(EVALUATOR_PATH),
            "--workspace", str(workspace), "--mode", mode, "--split", split,
-           "--out", str(out_path), "--run-id", run_id, "--nonce", nonce]
+           "--out", str(out_path), "--run-id", run_id, "--nonce", nonce,
+           "--sandbox-backend", sb.backend,
+           "--sandbox-memory-mb", str(sb.memory_mb),
+           "--sandbox-cpus", str(sb.cpus),
+           "--sandbox-pids", str(sb.pids_limit)]
+    if sb.image:
+        cmd += ["--sandbox-image", sb.image]
     if seed_index is not None:
         cmd += ["--seed-index", str(seed_index)]
     try:
@@ -2152,6 +2204,15 @@ def run_evaluator(guard: ProtectionGuard, workspace: Path, mode: str,
         raise ProtectionViolation(
             f"seed_index echo mismatch for {run_id}: asked {seed_index!r}, "
             f"evaluator reports {metrics.get('seed_index')!r}"
+        )
+    # Phase 6a: the evaluator must echo the isolation backend we requested. A
+    # mismatch means an evaluator that ignored the flag (stale binary) or a
+    # tampered metrics file — either way the isolation guarantee is void.
+    sb_echo = metrics.get("sandbox") or {}
+    if sb_echo.get("backend") != sb.backend:
+        raise ProtectionViolation(
+            f"sandbox backend echo mismatch for {run_id}: requested "
+            f"{sb.backend!r}, evaluator reports {sb_echo.get('backend')!r}"
         )
     manifest_files = guard.load_manifest()["files"]
     expected = manifest_files.get("evaluation/evaluate.py")
@@ -3631,7 +3692,21 @@ def _load_evaluator_declarations() -> dict:
         "metric_direction": module.PRIMARY_METRIC_DIRECTION,
         "split_names": tuple(module.SPLIT_NAMES),
         "max_test_seeds": int(module.MAX_TEST_SEEDS),
+        "sandbox_backends": tuple(module.SUPPORTED_SANDBOX_BACKENDS),
     }
+
+
+def _sandbox_preflight(contract: ResearchContract) -> None:
+    """Fail-closed sandbox readiness (no-op for the subprocess backend).
+
+    Runs BEFORE any evaluator spend, converting the sandbox layer's
+    SandboxError into an OrchestratorError so it aborts the whole command with
+    an actionable message — the container backend must never silently degrade
+    to the unisolated subprocess path."""
+    try:
+        sandbox_preflight(contract.sandbox)
+    except SandboxError as exc:
+        raise OrchestratorError(str(exc)) from None
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -3699,6 +3774,18 @@ def cmd_init(args: argparse.Namespace) -> int:
             f"assurance.finalist_seeds {contract.assurance.finalist_seeds} "
             f"exceeds evaluator MAX_TEST_SEEDS {declared['max_test_seeds']}"
         )
+    # Phase 6a: the contract's chosen isolation backend must be one the
+    # evaluator actually implements (same hardcode + cross-check discipline as
+    # budgets/metric above).
+    if contract.sandbox.backend not in declared["sandbox_backends"]:
+        raise ContractError(
+            f"sandbox-backend drift: contract selects "
+            f"{contract.sandbox.backend!r} but the evaluator supports "
+            f"{declared['sandbox_backends']}"
+        )
+    # Fail closed BEFORE any git work or baseline spend if the container
+    # backend's daemon/image is not ready.
+    _sandbox_preflight(contract)
 
     if not git.is_repo():
         git.init_repo()
@@ -3898,6 +3985,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     guard = ProtectionGuard(ROOT, contract)
     if not git.is_repo() or not git.has_head():
         raise OrchestratorError("not initialized — run `orchestrator.py init` first")
+
+    # Phase 6a: fail closed before any generation spend if the isolation
+    # backend is not ready (no-op for the subprocess backend).
+    _sandbox_preflight(contract)
 
     ctx = build_context(args, contract, git, guard)
     recover(ctx)
@@ -4225,6 +4316,9 @@ def cmd_report(args: argparse.Namespace) -> int:
     })
 
     # --- multi-seed test evaluation (Phase 5) ---------------------------------
+    # Phase 6a: fail closed before spending the single-use test split if the
+    # isolation backend is not ready (no-op for the subprocess backend).
+    _sandbox_preflight(contract)
     figures_dir = report_dir / "figures"
     n_seeds = contract.assurance.finalist_seeds
     baseline_commit = baseline_rec["commit"]

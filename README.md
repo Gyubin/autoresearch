@@ -1,4 +1,4 @@
-# AutoResearch — Executable Autoresearch Loop (Phase 1 + 2 + 3 + 4 + 5)
+# AutoResearch — Executable Autoresearch Loop (Phase 1 + 2 + 3 + 4 + 5 + 6a)
 
 2026 SOTA 블루프린트(Arbor / Gome / ERA / SciNav 종합)의 구현. **Karpathy 스타일
 keep/reject 루프 + Arbor 스타일 상태 관리**에서 시작해, **병렬 가설 포트폴리오 +
@@ -28,6 +28,7 @@ uv run python tests/test_phase2.py                 # Phase 2 드릴
 uv run python tests/test_phase3.py                 # Phase 3 드릴 (문헌 그라운딩)
 uv run python tests/test_phase4.py                 # Phase 4 드릴 (momentum / 조향 / halving / pairwise)
 uv run python tests/test_phase5.py                 # Phase 5 드릴 (bootstrap / claims / report / gate / reviewer / families)
+uv run python tests/test_phase6.py                 # Phase 6 드릴 (샌드박스 argv·마스킹·fail-closed, Docker 불필요)
 ```
 
 `--gate pairwise`를 붙이면 admission(스칼라 epsilon)은 그대로 두고, admission을
@@ -263,6 +264,51 @@ gate 점수는 어떤 산출물에도 유입되지 않는다.
   코더 diff를 결정적으로 분류한 계열(`feature_spec_interaction` 등)로 세분한다.
   계열은 실험 레코드에 저장돼 replay==live가 유지된다.
 
+## Phase 6a — 실행 격리 샌드박스 (진짜 OS 격리 · Blueprint Layer 5)
+
+신뢰불가 후보 코드가 실제로 *실행*되는 지점은 `evaluation/evaluate.py`의 `_run_train`
+하나다(채점은 호스트 신뢰 경로에 남고 held-out 시드는 거기로 안 넘어간다). Phase 6a는
+이 실행만 OS 격리로 감싼다.
+
+- **`Sandbox` 프로토콜** (`sandbox/runner.py` — protected·stdlib·평가기가 절대경로로
+  로드): `SubprocessSandbox`(현행 동작 이식, 기본값 `subprocess`에서 바이트 동일) +
+  `ContainerSandbox`(`docker run`). 문헌의 `Retriever` 심 패턴을 그대로 미러.
+- **컨테이너 하드닝**: `--network none`(네트워크 차단), `--read-only`(읽기전용 rootfs),
+  `--cap-drop ALL` + `--security-opt no-new-privileges`, 비루트 user,
+  `--memory/--cpus/--pids-limit`, `--rm --init`(ephemeral PID 네임스페이스 →
+  TOCTOU 데몬 잔존 불가). 워크스페이스는 `:ro`, artifacts만 별도 fresh 호스트 dir로
+  rw 마운트(워크트리 원본 불변).
+- **시드/원장 마스킹**: 워크스페이스가 ROOT든 워크트리든 `heldout_config.json`은 빈
+  파일로, `experiments/`(gate 점수)는 tmpfs로 마스킹 → 컨테이너 FS에 물리적 부재.
+- **fail-closed**: 데몬/이미지 부재 시 절대 `subprocess`로 조용히 폴백하지 않고
+  actionable 에러로 중단(`run`/`init`/`report` 진입 preflight). 이미지는 미리
+  `docker pull` 해둬야 한다(runs는 `--network none`이라 on-demand pull 불가).
+- **계약 v6 `sandbox` 블록**: `backend`(subprocess|container)·`image`(digest 핀)·
+  `memory_mb`·`cpus`·`pids_limit`. backend는 init에서 캠페인 단위로 고정 → baseline·
+  후보가 동일 파이프라인이라 Phase 5 paired bootstrap 유효. 평가기가
+  `SUPPORTED_SANDBOX_BACKENDS`를 선언, init이 계약과 교차검증. `metrics["sandbox"]`
+  provenance를 `run_evaluator`가 요청 backend와 에코 대조(우회·구버전 탐지).
+- **gVisor 드롭인**: Linux에서 `sandbox/runner.py`에 `--runtime=runsc` 한 줄 추가로
+  syscall 격리 강화(마운트/보안 모델 불변).
+
+옵트인 예 (Docker 데몬 실행 + 이미지 pull 후):
+
+```yaml
+# research_contract.yaml
+sandbox:
+  backend: container
+  image: "python:3.14-slim@sha256:<digest>"
+  memory_mb: 512
+  cpus: 1.0
+  pids_limit: 128
+```
+
+```bash
+docker pull python:3.14-slim@sha256:<digest>   # --network none이라 미리 받아둠
+uv run python orchestrator.py init --force     # baseline도 컨테이너에서 학습
+uv run python orchestrator.py run --generations 1
+```
+
 ## 보호 모델 (Phase 1에서 닫은 것)
 
 - **held-out 시드의 물리적 부재**: `evaluation/heldout_config.json`은 init 때
@@ -273,7 +319,9 @@ gate 점수는 어떤 산출물에도 유입되지 않는다.
 - **nonce 에코**: 오케스트레이터가 라운드마다 새 nonce를 전달, 평가기가
   metrics에 에코 (학습 서브프로세스에는 절대 전달 안 됨) → 위조 metrics 차단
 - **격리된 학습 서브프로세스**: 처음부터 구성한 env(PATH, PYTHONHASHSEED=0),
-  `-s -B` 플래그, 자체 세션 + 타임아웃 시 프로세스 그룹 SIGKILL
+  `-s -B` 플래그, 자체 세션 + 타임아웃 시 프로세스 그룹 SIGKILL. **Phase 6a: 이
+  실행이 `Sandbox` 프로토콜을 거치며, `sandbox.backend: container`에선 OS 격리로
+  승격된다(위 Phase 6a 절 참조)**
 - **아티팩트 검증**: symlink 거부, 1MB 상한, 유한성 검사, train_rmse 재계산
 - **SHA-256 manifest** 매 라운드 검증 + protected 파일 chmod 444 +
   worktree diff/status를 glob으로 평가 전·후 검사 + 평가기 자기 해시를
@@ -286,15 +334,16 @@ gate 점수는 어떤 산출물에도 유입되지 않는다.
 - **단일 인스턴스 잠금**(flock): 동시 `run`이 진행 중인 worktree를 파괴하는
   것을 차단. rename을 통한 protected 파일 이동도 diff `--no-renames`로 탐지
 
-### 정직한 한계 (Phase 6 과제)
+### 정직한 한계 (Phase 6b/6c 과제)
 
-- held-out 시드는 로컬 사용자가 루트에서 읽을 수 있다 (정책적 보호 수준). 코더는
-  가드 훅으로 못 읽지만, 진짜 격리는 컨테이너/가상화 샌드박스가 필요
-- 코더/학습 코드가 백그라운드 데몬을 남겨 평가 후 파일을 조작하는 TOCTOU류 공격,
-  워크스페이스 밖 파일쓰기(감지는 되나 방지는 아님), 네트워크 접근은 OS 샌드박스
-  (gVisor/Firecracker/컨테이너) 없이는 못 막는다
+- **진짜 격리는 Phase 6a에서 구현됐다** — 단 `sandbox.backend: container`를 옵트인
+  했을 때만 강제된다. 이 backend에선 held-out 시드가 마스킹돼 컨테이너 FS에 부재하고,
+  TOCTOU(백그라운드 데몬)·워크스페이스 밖 파일쓰기·네트워크가 `--network none`·읽기
+  전용 rootfs·ephemeral PID 네임스페이스로 OS 차단된다. **기본값 `subprocess`에선**
+  학습 서브프로세스가 정책적 보호 수준이라 위 위협들이 남는다(현행 동작·Docker 불필요).
+  하드닝 보장을 원하면 계약에서 `container` + digest 핀 이미지로 전환하면 된다
 - 문헌 엔진은 mock corpus 전용이다 — 실 API(OpenAlex/S2) 어댑터는 `Retriever`
-  시임만 있고 미구현. 코더 가설의 개입 계열 분류는 키워드 매칭이라 보수적
+  시임만 있고 미구현 (Phase 6b). 코더 가설의 개입 계열 분류는 키워드 매칭이라 보수적
   (모호하면 분류 포기 → unexplored)
 - **pairwise 심판은 같은 Claude 계열**이라 상관된 편향은 제거되지 않는다 — 진짜
   이질적 리뷰어는 Phase 5의 cross-model codex 리뷰어(`--reviewer codex`)로 닫혔다.
@@ -303,26 +352,29 @@ gate 점수는 어떤 산출물에도 유입되지 않는다.
   입력이 아니다)
 - successive halving은 파라미터 수만큼(휴리스틱 one-per-param ≤6) 브랜치를 채우는
   현 규모에선 K=8일 때 실익이 크고, K=4에선 dev 평가 시간 절감 정도다
-- 진짜 격리(컨테이너/가상화 샌드박스), 실 문헌 API(OpenAlex/S2) 어댑터, 실제 연구
-  도메인 태스크 교체는 아직 없음 (블루프린트 Phase 6)
+- 실 문헌 API(OpenAlex/S2) 어댑터(6b), 실제 연구 도메인 태스크 교체(6c)는 아직
+  없음. gVisor/Firecracker 백엔드는 Linux에서 `sandbox/runner.py`에 `--runtime=runsc`
+  한 줄로 드롭인 가능(후속). 코더 에이전트 자체의 컨테이너화도 후속 하드닝
 
 ## 파일 구조
 
 ```
-research_contract.yaml    # Layer 1 타입드 계약 (v5: + assurance/reviewer/human_gate) — 불변, protected
-orchestrator.py           # 코디네이터 + gate + 코더 + 문헌 시임 + momentum/halving + 승인 게이트 + 다중시드 report (protected)
+research_contract.yaml    # Layer 1 타입드 계약 (v6: + sandbox 블록) — 불변, protected
+orchestrator.py           # 코디네이터 + gate + 코더 + 문헌 시임 + momentum/halving + 승인 게이트 + 다중시드 report + 샌드박스 배선 (protected)
+sandbox/runner.py         # Phase 6a 실행 격리 (protected): Sandbox 프로토콜 / SubprocessSandbox / ContainerSandbox / preflight
 assurance/                # Phase 5 순수 패키지 (protected): stats/claims/report_md/figures/svgfig/reviewer/gate/families
 literature/engine.py      # 문헌 엔진: corpus/검색/stance/novelty/move_guidance/LLM 분석기 (protected)
 literature/corpus/mock_corpus.json  # 가공 논문 13편/claim 15개 (protected, git 추적)
 src/train.py              # 편집 가능 표면 (HYPERPARAMS 블록 + FEATURE_SPEC)
-evaluation/evaluate.py    # 보호된 평가기 → metrics.json (--split dev|gate|test, --seed-index)
+evaluation/evaluate.py    # 보호된 평가기 → metrics.json (--split dev|gate|test, --seed-index, --sandbox-backend)
 evaluation/dataset.py     # 합성 데이터 (train 공개 + dev/gate 시드 + test 시드 N개 분리)
 evaluation/heldout_config.json  # init 생성, untracked (schema v3: dev/gate 시드 + test 시드 N개, worktree에 부재)
-protection/hashes.json    # SHA-256 manifest (20개 파일, git 추적)
+protection/hashes.json    # SHA-256 manifest (22개 파일, git 추적)
 tests/test_phase2.py      # 단위 드릴 (가드 훅 / stagnation / blindness / feature_spec)
-tests/test_phase3.py      # 문헌 드릴 (결정성 / blindness canary / 론더링 / 인젝션 / 계약 v5)
-tests/test_phase4.py      # 정제 드릴 (momentum / 조향 / halving / pruned / pairwise / 계약 v5)
+tests/test_phase3.py      # 문헌 드릴 (결정성 / blindness canary / 론더링 / 인젝션 / 계약)
+tests/test_phase4.py      # 정제 드릴 (momentum / 조향 / halving / pruned / pairwise / 계약)
 tests/test_phase5.py      # assurance 드릴 (bootstrap / claims / report digit-scan / gate / codex 리뷰어 stub / families)
+tests/test_phase6.py      # 샌드박스 드릴 (subprocess 회귀 / container argv·마스킹 / fail-closed / provenance echo, Docker 불필요)
 experiments/              # 런타임: state.json, ledger.jsonl, rounds/, generations/, evidence/,
                           #   claims.jsonl, report/(report.md · figures/ · review/) (gitignored)
 insight_memory.json       # ledger에서 재구성 가능한 파생 데이터 (gitignored)
@@ -338,10 +390,10 @@ gate 결정은 `record_type=gate` 레코드로 별도 기록(점수는 blindness
 
 실행 중이 아닐 때: `chmod u+w <파일>` → 수정 → `uv run python orchestrator.py
 init --force` (dev/gate/test 시드·manifest 재생성 + 재베이스라인). `--force`는
-experiments/를 비우므로 이전 캠페인 기록이 필요하면 먼저 백업할 것. Phase 5는
-계약 schema가 v5(+ assurance / reviewer / human_gate 블록)이고 heldout_config는
-v3(test 시드 N개)라, 이전 계약·상태에서 이어 돌릴 수 없고 `init --force`로 새
-캠페인을 시작해야 한다. 보호 manifest는 20개 파일(assurance/ 9개 포함)이다.
+experiments/를 비우므로 이전 캠페인 기록이 필요하면 먼저 백업할 것. Phase 6a는
+계약 schema가 v6(+ sandbox 블록)이고 heldout_config는 v3(test 시드 N개)라, 이전
+계약·상태에서 이어 돌릴 수 없고 `init --force`로 새 캠페인을 시작해야 한다. 보호
+manifest는 22개 파일(assurance/ 9 + sandbox/ 2 포함)이다.
 
 ## 남은 로드맵 (블루프린트 기준)
 
@@ -349,8 +401,12 @@ Phase 1(제약된 keep/reject) + Phase 2(포트폴리오·blind gate·LLM 코더
 Phase 3(claim 수준 문헌 그라운딩·mock corpus) + Phase 4(Gome search momentum·
 증거 조향·successive halving·SciNav pairwise gate) + Phase 5(assurance + 보고 —
 다중 시드 finalist 재현 + paired bootstrap CI, claim-evidence ledger, 결정적
-report.md + SVG 그림, cross-model codex 적대 리뷰어, human 승인 gate) 완료. 다음:
+report.md + SVG 그림, cross-model codex 적대 리뷰어, human 승인 gate) +
+Phase 6a(실행 격리 샌드박스 — `Sandbox` 프로토콜, Docker `ContainerSandbox`로
+`train.py` 실행을 OS 격리: 네트워크 차단·읽기전용 rootfs·시드/원장 마스킹·ephemeral
+PID 네임스페이스, `subprocess` 기본/`container` 옵트인, fail-closed) 완료. 다음:
 
-6. **진짜 격리 + 실 문헌**: 컨테이너/gVisor/Firecracker 샌드박스로 코더·학습을 OS
-   수준 격리(현재는 정책적 가드 훅 + 루트 지문뿐), 실 문헌 API(OpenAlex/S2)
-   어댑터를 `Retriever` 뒤에 구현, mock 합성 회귀를 실제 연구 도메인으로 교체.
+6b. **실 문헌 API**: OpenAlex/S2 어댑터를 `Retriever` 뒤에 구현 + fetch-once 스냅샷
+    캐시(결정론 유지) + `ground --refresh`.
+6c. **실제 연구 도메인**: mock 합성 회귀를 실제 도메인으로 교체(평가기·계약·문헌
+    코퍼스 재설계).

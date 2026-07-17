@@ -622,8 +622,8 @@ def test_llm_fallback_and_budget(tmp: Path) -> None:
 def test_contract_literature(tmp: Path) -> None:
     contract = orch.load_contract()
     lit = contract.literature
-    check("contract: v5 literature block parsed",
-          contract.schema_version == 5 and lit.enabled
+    check("contract: literature block parsed",
+          contract.schema_version == 6 and lit.enabled
           and lit.retriever == "lexical"
           and lit.corpus_path == "literature/corpus/mock_corpus.json"
           and lit.llm_max_campaign_budget_usd is None)
@@ -640,7 +640,7 @@ def test_contract_literature(tmp: Path) -> None:
             check(f"contract: {name} rejected", True)
 
     expect_reject("schema_version 2",
-                  text.replace("schema_version: 5", "schema_version: 2"))
+                  text.replace("schema_version: 6", "schema_version: 2"))
     expect_reject("corpus outside literature/",
                   text.replace(
                       'corpus_path: "literature/corpus/mock_corpus.json"',

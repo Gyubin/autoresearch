@@ -111,8 +111,8 @@ def _augmented(base: list[dict], extra: list[dict]) -> list[dict]:
 
 def test_contract_v5(tmp: Path) -> None:
     contract = orch.load_contract()
-    check("contract: v5 schema + new blocks parsed",
-          contract.schema_version == 5
+    check("contract: v6 schema + new blocks parsed",
+          contract.schema_version == 6
           and contract.assurance.finalist_seeds == 5
           and contract.assurance.bootstrap_resamples == 10000
           and contract.assurance.confidence_level == 0.95
@@ -134,7 +134,7 @@ def test_contract_v5(tmp: Path) -> None:
             check(f"contract: {name} rejected", True)
 
     expect_reject("schema_version 4",
-                  text.replace("schema_version: 5", "schema_version: 4"))
+                  text.replace("schema_version: 6", "schema_version: 4"))
     expect_reject("unknown top-level block (typo)",
                   text + "\nassurnce:\n  finalist_seeds: 3\n")
     expect_reject("finalist_seeds 0",

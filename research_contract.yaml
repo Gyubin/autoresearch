@@ -10,8 +10,8 @@
 # To intentionally change the contract: stop all runs, `chmod u+w` the file,
 # edit, then re-run `orchestrator.py init --force` to rebuild the manifest.
 # =============================================================================
-schema_version: 5
-contract_id: autoresearch-phase5-assurance
+schema_version: 6
+contract_id: autoresearch-phase6-sandbox
 
 objective: >
   Minimize held-out RMSE of the model trained by src/train.py. Interventions
@@ -54,6 +54,11 @@ protected_globs:
   # the bootstrap or the claim validator could launder results past the
   # reviewer. It performs no runtime writes (all IO stays in the orchestrator).
   - "assurance/**"
+  # Phase 6a: the sandbox package IS the isolation boundary — the evaluator
+  # loads it to confine the untrusted trainer. A coder that could edit it could
+  # drop the docker security flags or unmask the held-out seed mount, so it
+  # must live on the trusted path like literature/** and assurance/**.
+  - "sandbox/**"
 
 budgets:
   # Must match the hardcoded values in evaluation/evaluate.py; the evaluator
@@ -196,3 +201,32 @@ human_gate:
   # train the human to rubber-stamp the one irreversible decision that matters.
   enabled: true
   require_approval_for: [first_report, force_report]
+
+sandbox:
+  # Phase 6a execution isolation (Blueprint Layer 5). Only the untrusted
+  # candidate trainer's EXECUTION is isolated; scoring stays in the trusted
+  # root evaluator, which holds the held-out seeds. The backend is fixed for a
+  # campaign at init (baseline and every candidate share it, so the Phase 5
+  # paired bootstrap compares like with like).
+  #
+  #   subprocess : historical host subprocess — NO OS isolation (the trainer
+  #                runs with the invoking user's privileges). Byte-identical to
+  #                pre-Phase-6 behaviour. The default so Docker-less machines
+  #                and the self-contained tests keep working.
+  #   container  : `docker run` isolation — no network, read-only rootfs,
+  #                dropped capabilities, non-root user, resource limits, an
+  #                ephemeral PID namespace, and the held-out seed file / gate
+  #                ledger masked out of the mount. Requires a running daemon and
+  #                a locally-present pinned image (runs are --network none, so
+  #                the image cannot be pulled on demand); a missing daemon/image
+  #                is a hard error — it NEVER degrades silently to subprocess.
+  #                On Linux, add `--runtime=runsc` in sandbox/runner.py for
+  #                gVisor-grade isolation with no other change.
+  backend: subprocess
+  # Required when backend is container; pin by digest for reproducibility, e.g.
+  # "python:3.14-slim@sha256:<digest>". Ignored by the subprocess backend.
+  image: null
+  # Container resource limits (ignored by the subprocess backend).
+  memory_mb: 512
+  cpus: 1.0
+  pids_limit: 128

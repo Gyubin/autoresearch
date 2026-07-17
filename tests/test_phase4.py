@@ -872,7 +872,7 @@ def test_contract_v4(tmp: Path) -> None:
             check(f"contract: {name} rejected", True)
 
     expect_reject("schema_version 4",
-                  text.replace("schema_version: 5", "schema_version: 4"))
+                  text.replace("schema_version: 6", "schema_version: 4"))
     expect_reject("unknown top-level block (typo)",
                   text + "\nrefinment:\n  enabled: true\n")
     expect_reject("momentum_decay 1.0",
