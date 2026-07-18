@@ -79,7 +79,8 @@ def _primary_effect(boot, meta: dict) -> dict:
     else:
         status = "inconclusive"
 
-    limitations = ["single synthetic task family (mock regression surrogate)"]
+    limitations = ["single synthetic Euclidean-TSP instance family (uniform "
+                   "random points)"]
     if aliased:
         limitations.append("incumbent == baseline: no candidate was admitted, "
                            "so the reported effect is exactly zero")
@@ -158,7 +159,7 @@ def _admitted_improvements(records: list[dict], corrected: set[str],
             what = f"{iv['param']} {iv['from']!r} -> {iv['to']!r}"
         else:
             what = f"coder change ({(hyp.get('statement') or '')[:60]})"
-        text = (f"{what} improved dev held-out RMSE from {before} to {after} "
+        text = (f"{what} improved dev mean tour length from {before} to {after} "
                 f"in generation {r.get('generation')} and passed the blind "
                 f"admission gate.")
         out.append(_claim(

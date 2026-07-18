@@ -111,8 +111,8 @@ def _augmented(base: list[dict], extra: list[dict]) -> list[dict]:
 
 def test_contract_v5(tmp: Path) -> None:
     contract = orch.load_contract()
-    check("contract: v6 schema + new blocks parsed",
-          contract.schema_version == 6
+    check("contract: v8 schema + new blocks parsed",
+          contract.schema_version == 8
           and contract.assurance.finalist_seeds == 5
           and contract.assurance.bootstrap_resamples == 10000
           and contract.assurance.confidence_level == 0.95
@@ -134,7 +134,7 @@ def test_contract_v5(tmp: Path) -> None:
             check(f"contract: {name} rejected", True)
 
     expect_reject("schema_version 4",
-                  text.replace("schema_version: 6", "schema_version: 4"))
+                  text.replace("schema_version: 8", "schema_version: 4"))
     expect_reject("unknown top-level block (typo)",
                   text + "\nassurnce:\n  finalist_seeds: 3\n")
     expect_reject("finalist_seeds 0",
@@ -199,9 +199,9 @@ def test_record_type_inertness() -> None:
 # ---------------------------------------------------------------------------
 
 def test_dataset_multiseed(tmp: Path) -> None:
-    cfg = tmp / "heldout_v3.json"
+    cfg = tmp / "heldout_v4.json"
     cfg.write_text(json.dumps({
-        "schema_version": 3,
+        "schema_version": 4,
         "splits": {
             "dev": {"seed": 111},
             "gate": {"seed": 222},
@@ -209,23 +209,24 @@ def test_dataset_multiseed(tmp: Path) -> None:
         },
     }))
 
-    # test seed_index selects the matching generate() dataset
+    # load_split now returns a LIST of instance dicts (coords per instance).
+    # test seed_index selects the matching generate() instance set
     ok = True
     for i, seed in enumerate((333, 444, 555)):
-        xs, ys = ds.load_split(cfg, "test", i)
-        gx, gy = ds.generate(seed, ds.SPLIT_SIZES["test"])
-        ok = ok and ys == gy and xs == gx
+        got = ds.load_split(cfg, "test", i)
+        want = ds.generate(seed, ds.SPLIT_SIZES["test"])
+        ok = ok and got == want
     check("dataset: test seed_index selects the matching seed", ok)
 
-    # distinct seeds -> distinct datasets
-    _, y0 = ds.load_split(cfg, "test", 0)
-    _, y1 = ds.load_split(cfg, "test", 1)
-    check("dataset: distinct test seeds -> distinct data", y0 != y1)
+    # distinct seeds -> distinct instance sets
+    i0 = ds.load_split(cfg, "test", 0)
+    i1 = ds.load_split(cfg, "test", 1)
+    check("dataset: distinct test seeds -> distinct data", i0 != i1)
 
     # dev/gate accept only seed_index 0; a positive index is out of range
-    dxs, dys = ds.load_split(cfg, "dev", 0)
+    dev = ds.load_split(cfg, "dev", 0)
     check("dataset: dev seed_index 0 works",
-          (dxs, dys) == ds.generate(111, ds.SPLIT_SIZES["dev"]))
+          dev == ds.generate(111, ds.SPLIT_SIZES["dev"]))
     try:
         ds.load_split(cfg, "dev", 1)
         check("dataset: dev seed_index 1 rejected", False, "no IndexError")
@@ -241,7 +242,7 @@ def test_dataset_multiseed(tmp: Path) -> None:
 
     # duplicate seeds rejected
     dup = tmp / "heldout_dup.json"
-    dup.write_text(json.dumps({"schema_version": 3, "splits": {
+    dup.write_text(json.dumps({"schema_version": 4, "splits": {
         "dev": {"seed": 1}, "gate": {"seed": 2},
         "test": {"seeds": [9, 9]}}}))
     try:
@@ -252,7 +253,7 @@ def test_dataset_multiseed(tmp: Path) -> None:
 
     # a split entry with neither/both of seed|seeds is rejected
     bad = tmp / "heldout_bad.json"
-    bad.write_text(json.dumps({"schema_version": 3, "splits": {
+    bad.write_text(json.dumps({"schema_version": 4, "splits": {
         "dev": {"seed": 1, "seeds": [2]}, "gate": {"seed": 3},
         "test": {"seeds": [4]}}}))
     try:
@@ -275,15 +276,17 @@ def test_evaluator_declarations() -> None:
 
 def _metrics(errs: list[float] | None, fp: str = "fp0",
              fail: str | None = None) -> dict:
-    """A test-split metrics dict shaped like the evaluator's output."""
-    rmse = math.sqrt(sum(errs) / len(errs)) if errs else None
-    value = None if fail else rmse
+    """A test-split metrics dict shaped like the evaluator's output. `errs` are
+    per-instance tour lengths; the pooled statistic is now their arithmetic MEAN
+    (Phase 6c), not sqrt(mean) as in the RMSE domain."""
+    pooled = sum(errs) / len(errs) if errs else None
+    value = None if fail else pooled
     return {
-        "primary_metric": {"name": "heldout_rmse", "direction": "minimize",
+        "primary_metric": {"name": "mean_tour_length", "direction": "minimize",
                            "value": value},
-        "metrics": {"heldout_rmse": rmse,
-                    "per_example_sq_errors": errs},
-        "dataset": {"heldout_fingerprint": fp, "seed_index": 0},
+        "metrics": {"mean_tour_length": pooled,
+                    "per_instance_tour_length": errs},
+        "dataset": {"instances_fingerprint": fp, "seed_index": 0},
         "failure_class": fail,
     }
 
@@ -297,9 +300,9 @@ def _run(baseline_ms, incumbent_ms, *, resamples=200, seed=None, conf=0.95):
 
 
 def test_bootstrap_known_answer() -> None:
-    # (a) constant errors: e_b=1.0, e_inc=0.81 -> rmse 1.0 vs 0.9, effect 0.1.
+    # (a) constant lengths: mean 1.0 vs 0.9 -> effect 0.1 (pooled mean statistic).
     b = _metrics([1.0] * 400)
-    i = _metrics([0.81] * 400)
+    i = _metrics([0.9] * 400)
     r = _run([b], [i])
     check("bootstrap: constant effect_abs == 0.1",
           r.clean and abs(r.effect_abs - 0.1) < 1e-9, f"{r.effect_abs}")
@@ -383,32 +386,31 @@ def test_bootstrap_edges() -> None:
 _CODER = {"executor": "coder"}
 _PATCHER = {"executor": "patcher"}
 
-DIFF_INTERACTION = (
+DIFF_NEIGHBORHOOD = (
     "--- a/src/train.py\n+++ b/src/train.py\n"
-    "-FEATURE_SPEC = [[j] for j in range(N_FEATURES)]\n"
-    "+FEATURE_SPEC = [[j] for j in range(N_FEATURES)] + [[0, 1]]\n")
-DIFF_UNARY = (
+    '-NEIGHBORHOOD = "two_opt"\n'
+    '+NEIGHBORHOOD = "or_opt"\n')
+DIFF_CONSTRUCTION = (
     "--- a/src/train.py\n+++ b/src/train.py\n"
-    "-FEATURE_SPEC = [[j] for j in range(N_FEATURES)]\n"
-    "+FEATURE_SPEC = [[j] for j in range(N_FEATURES)] + [[3]]\n")
-DIFF_HP = (
+    "+    base = greedy_edge(coords) if hp else nearest_neighbor(coords)\n")
+DIFF_ACCEPT = (
     "--- a/src/train.py\n+++ b/src/train.py\n"
-    '-    "lr": 0.005,\n+    "lr": 0.02,\n')
-DIFF_LOOP = (
+    "+        accept = _accepts(delta, temperature)\n")
+DIFF_PERTURB = (
     "--- a/src/train.py\n+++ b/src/train.py\n"
-    "-        loss = mse(pred, y)\n+        loss = mse(pred, y) + l2_term\n")
-DIFF_MULTI = (  # touches FEATURE_SPEC interaction AND the loop -> non-atomic
+    "+        start = _perturb(best, rng, strength)\n")
+DIFF_MULTI = (  # touches the neighborhood AND a perturbation -> non-atomic
     "--- a/src/train.py\n+++ b/src/train.py\n"
-    "+FEATURE_SPEC = [[j] for j in range(N_FEATURES)] + [[0, 1]]\n"
-    "+        loss = mse(pred, y) + reg\n")
+    '+NEIGHBORHOOD = "or_opt"\n'
+    "+        start = _perturb(best, rng, strength)\n")
 
 
 def test_families_classify() -> None:
     cases = [
-        ("feature_spec_interaction", DIFF_INTERACTION),
-        ("feature_spec_unary", DIFF_UNARY),
-        ("hyperparam_code", DIFF_HP),
-        ("training_loop", DIFF_LOOP),
+        ("neighborhood_operator", DIFF_NEIGHBORHOOD),
+        ("construction_change", DIFF_CONSTRUCTION),
+        ("acceptance_criterion", DIFF_ACCEPT),
+        ("perturbation", DIFF_PERTURB),
     ]
     for expected, diff in cases:
         got = families.classify(_CODER, diff)
@@ -421,7 +423,7 @@ def test_families_classify() -> None:
     check("families: empty diff -> none",
           families.classify(_CODER, "") == "none")
     check("families: patcher -> none",
-          families.classify(_PATCHER, DIFF_INTERACTION) == "none")
+          families.classify(_PATCHER, DIFF_NEIGHBORHOOD) == "none")
 
 
 def _momentum(records, *, coder_families):
@@ -435,17 +437,17 @@ def test_families_momentum_integration() -> None:
     # An accepted coder run carrying a stored coder_family.
     recs = [
         exp("r0001", 1, None, None, None, "valid_positive", "accept",
-            coder_family="feature_spec_interaction"),
+            coder_family="neighborhood_operator"),
     ]
     # Phase 4 compat: coder_families off -> the coarse "coder:none" key.
     off = _momentum(recs, coder_families=False)
     check("families: coder_families off keeps coder:none",
-          "coder:none" in off and "coder:feature_spec_interaction" not in off,
+          "coder:none" in off and "coder:neighborhood_operator" not in off,
           f"{list(off)}")
     # Phase 5: on -> subdivided key from the stored family.
     on = _momentum(recs, coder_families=True)
     check("families: coder_families on subdivides key",
-          "coder:feature_spec_interaction" in on and "coder:none" not in on,
+          "coder:neighborhood_operator" in on and "coder:none" not in on,
           f"{list(on)}")
     # A coder run with family "none" stays coarse even when on.
     recs_none = [exp("r0002", 1, None, None, None, "valid_positive", "accept",
@@ -459,11 +461,11 @@ def test_families_replay_symmetry() -> None:
     # at recompute time, so a "replay" over the same ledger is byte-identical
     # to the "live" fold (replay == live).
     recs = [
-        exp("r0001", 1, "lr", 0.005, 0.0125, "valid_positive", "accept"),
+        exp("r0001", 1, "max_iterations", 20000, 50000, "valid_positive", "accept"),
         exp("r0002", 1, None, None, None, "valid_negative", "reject",
-            fc="metric_regression", coder_family="training_loop"),
+            fc="metric_regression", coder_family="search_loop"),
         exp("r0003", 2, None, None, None, "valid_positive", "accept",
-            coder_family="feature_spec_interaction"),
+            coder_family="neighborhood_operator"),
     ]
     live = _momentum(recs, coder_families=True)
     replay = _momentum(list(recs), coder_families=True)
@@ -552,7 +554,7 @@ def test_gate_request_id_determinism() -> None:
 # ---------------------------------------------------------------------------
 
 _META = {
-    "objective": "minimize held-out RMSE", "metric_name": "heldout_rmse",
+    "objective": "minimize mean tour length", "metric_name": "mean_tour_length",
     "metric_direction": "minimize", "contract_id": "ctr", "campaign_id": "camp",
     "baseline_commit": "c0", "incumbent_commit": "c1",
     "dev_baseline": 0.5, "dev_incumbent": 0.45, "incumbent_runs_aliased": False,

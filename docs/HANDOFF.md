@@ -1,10 +1,11 @@
-# AutoResearch — 세션 인수인계 (Phase 6b 이어가기 전 먼저 읽기)
+# AutoResearch — 세션 인수인계 (Phase 6b/6c 이후 먼저 읽기)
 
 이 문서는 빈 세션이 이 프로젝트를 이어받기 위한 **단일 진입점**이다. 순서대로
 읽으면 된다: 이 파일 → `docs/BLUEPRINT.md`(설계 근거·레이어 사양) →
 `README.md`(사용법) → 필요한 코드.
 
-작성 시점: 2026-07-18 (Phase 6a 반영 갱신). Phase 1~5 + 6a(실행 격리 샌드박스) 완료.
+작성 시점: 2026-07-18 (Phase 6b/6c 반영 갱신). Phase 1~5 + 6a + 6b + 6c 완료.
+**도메인이 mock 합성 회귀 → Euclidean-TSP 휴리스틱으로 교체됨** (contract v8).
 
 ---
 
@@ -26,9 +27,21 @@
   패키지의 `Sandbox` 프로토콜, Docker `ContainerSandbox`로 `train.py` 실행을 OS
   격리: 네트워크 차단·읽기전용 rootfs·시드/원장 마스킹·ephemeral PID 네임스페이스.
   `subprocess` 기본(현행 동일)·`container` 옵트인, fail-closed).
-- **다음**: Phase 6b(실 문헌 API OpenAlex/S2 어댑터 — `Retriever` 뒤 + fetch-once
-  스냅샷 캐시로 결정론 유지), Phase 6c(mock 합성 회귀를 실제 연구 도메인으로
-  교체 — 평가기·계약·코퍼스 재설계).
+  Phase 6b(실 문헌 API — `literature/sources.py`에 OpenAlex 어댑터 + `ground
+  --refresh`로 fetch→LLM 추출→동결 corpus 스냅샷. 네트워크는 refresh 때만, 캠페인은
+  얼린 스냅샷 위에서 lexical로 결정론 유지. S2 키는 env 전용, 반-laundering
+  가드로 주입 abstract가 support를 못 만들게 함) + Phase 6c(도메인을 Euclidean-TSP
+  휴리스틱으로 교체 — 평가기가 hidden seed로 인스턴스 생성→solver에 좌표만 전달→
+  tour 길이 재계산. seed는 샌드박스로 안 넘어감(불투명 id), 자가보고 objective 무시).
+- **미완/후속**: (1) 6c에서 patcher 하이퍼파라미터의 evidence_steering은 약함(param↔
+  family는 `engine.PARAM_TO_FAMILY`로 grounding은 연결되나 orchestrator rank()의
+  steering 조회는 미연결) — 후속 정렬 대상. (2) 현재 corpus(`tsp_corpus.json`)는
+  큐레이션된 오프라인 스냅샷(provenance 비어 있음)이며, 실 문헌 반영(Part C)은 네트워크
+  호스트에서 `ground --refresh` + 태그 diff 사람 리뷰 후. (3) subprocess 백엔드는
+  seed 파일 절대경로 접근이 가능해 gate/test 신뢰 채점은 `container` 백엔드에서만 완전.
+- **다음(실행 시)**: `uv run python orchestrator.py run --generations N` (또는 전체
+  LLM 경로 `--proposer claude --literature claude --gate pairwise`). 실 문헌으로
+  재그라운딩하려면 위 (2)의 Part C 절차.
 
 ## 1. 지금 실행해보기
 
@@ -79,7 +92,7 @@ gate는 계약(`pairwise_gate.enabled`)이 *여부*를, `--gate {scalar,pairwise
 | `sandbox/` | Phase 6a 실행 격리 (`runner.py`): `Sandbox` 프로토콜, `SubprocessSandbox`(현행), `ContainerSandbox`(docker), `build_sandbox`, `preflight`. stdlib·절대경로 로드·런타임 파일IO 없음 | ✅ (§3 폐포) |
 | `assurance/` | Phase 5 순수 패키지: `stats.py`(paired bootstrap), `claims.py`(claim ledger), `report_md.py`+`figures.py`+`svgfig.py`(결정적 보고/그림), `reviewer.py`(codex 어댑터), `gate.py`(승인 파생), `families.py`(코더 계열) | ✅ (§3-13 폐포) |
 | `literature/engine.py` | 문헌 엔진: corpus 검증, LexicalRetriever, EvidenceEngine, move_of/move_guidance, ClaudeLiteratureAnalyst, FallbackAnalyst (~1000줄, stdlib) | ✅ |
-| `literature/corpus/mock_corpus.json` | 가공 논문 13편/claim 15개 (모순쌍·론더링 트랩·인젝션 픽스처 포함) | ✅ (git 추적) |
+| `literature/corpus/tsp_corpus.json` | TSP 휴리스틱 논문 13편/claim 13개 (모순쌍·론더링 트랩·인젝션 픽스처 포함) | ✅ (git 추적) |
 | `evaluation/evaluate.py` | 보호된 평가기 → metrics.json (`--split dev|gate|test`) | ✅ |
 | `evaluation/dataset.py` | 합성 데이터, `load_split`, `SPLIT_SIZES` | ✅ |
 | `evaluation/heldout_config.json` | 숨은 dev/gate/test 시드 (init 생성, **git 미추적**) | — |

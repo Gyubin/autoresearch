@@ -65,7 +65,8 @@ import yaml
 # stdlib at import time (its LLM path lazy-imports the SDK), no orchestrator
 # import on its side, and it never reads experiments/ or state.
 from literature.engine import (ANTI_INJECTION_SENTENCE, CorpusError,
-                               build_engine, load_corpus, move_of)
+                               SUPPORTED_RETRIEVERS, build_engine, load_corpus,
+                               move_of)
 
 # The assurance package (Phase 5) is likewise a separate, protected module:
 # stdlib-only, never imports the orchestrator, and performs no file IO (all
@@ -112,7 +113,7 @@ WORKTREES_DIR = ROOT / ".worktrees"
 # delete a lock file another process holds.
 LOCK_PATH = ROOT / ".orchestrator.lock"
 
-STATE_SCHEMA_VERSION = 2
+STATE_SCHEMA_VERSION = 3
 
 # Phase 5: upper bound on hidden test seeds for finalist reproduction. Must
 # equal MAX_TEST_SEEDS in evaluation/evaluate.py; `init` cross-checks the two
@@ -366,6 +367,23 @@ class HumanGate:
 
 
 @dataclass(frozen=True)
+class LiteratureRefresh:
+    """Phase 6b: config for the `ground --refresh` MAINTENANCE op only (fetch
+    real papers → LLM-extract claims → frozen corpus snapshot). Never read on
+    the campaign path. The S2 API key is intentionally absent — it is ENV-only
+    (S2_API_KEY) so a secret never lands in this protected, committed file."""
+    sources: tuple[str, ...]
+    mailto: str | None
+    per_source_max: int
+    max_papers: int
+    max_retries: int
+    extractor: str
+    extractor_model: str | None
+    extractor_max_budget_usd: float
+    extractor_max_campaign_budget_usd: float | None
+
+
+@dataclass(frozen=True)
 class Literature:
     enabled: bool
     corpus_path: str
@@ -377,6 +395,9 @@ class Literature:
     citation_hops: int
     llm_max_budget_usd: float
     llm_max_campaign_budget_usd: float | None
+    # Phase 6b: None when the contract omits a `refresh` sub-block (mock-corpus
+    # campaigns never need it). Only `ground --refresh` consumes it.
+    refresh: LiteratureRefresh | None = None
 
 
 @dataclass(frozen=True)
@@ -421,6 +442,69 @@ def _str_tuple(mapping: dict, key: str, ctx: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+_REFRESH_SOURCES = ("openalex", "s2")
+
+
+def _parse_literature_refresh(ref_raw: Any) -> "LiteratureRefresh | None":
+    """Validate the Phase 6b `literature.refresh` sub-block (or None if absent).
+
+    Consumed ONLY by `ground --refresh`; the campaign path never reads it. The
+    S2 API key is deliberately NOT a field — it is ENV-only (S2_API_KEY)."""
+    if ref_raw is None:
+        return None
+    if not isinstance(ref_raw, dict):
+        raise ContractError("literature.refresh must be a mapping")
+    known = {"sources", "mailto", "per_source_max", "max_papers", "max_retries",
+             "extractor", "extractor_model", "extractor_max_budget_usd",
+             "extractor_max_campaign_budget_usd"}
+    unknown = sorted(set(ref_raw) - known)
+    if unknown:
+        raise ContractError(f"contract: unknown literature.refresh keys {unknown}")
+    sources = _str_tuple(ref_raw, "sources", "literature.refresh")
+    bad = [s for s in sources if s not in _REFRESH_SOURCES]
+    if bad:
+        raise ContractError(
+            f"literature.refresh.sources {bad} not in {_REFRESH_SOURCES}")
+    mailto = ref_raw.get("mailto")
+    if mailto is not None and (not isinstance(mailto, str) or "@" not in mailto):
+        raise ContractError(
+            "literature.refresh.mailto must be an email string or null")
+    extractor = ref_raw.get("extractor", "claude")
+    if extractor not in ("claude", "deterministic"):
+        raise ContractError(
+            "literature.refresh.extractor must be 'claude' or 'deterministic'")
+    model = ref_raw.get("extractor_model")
+    if model is not None and not isinstance(model, str):
+        raise ContractError("literature.refresh.extractor_model must be str/null")
+    per_source_max = _require(ref_raw, "per_source_max", int, "literature.refresh")
+    max_papers = _require(ref_raw, "max_papers", int, "literature.refresh")
+    max_retries = _require(ref_raw, "max_retries", int, "literature.refresh")
+    if min(per_source_max, max_papers) <= 0 or max_retries < 0:
+        raise ContractError(
+            "literature.refresh per_source_max/max_papers must be positive and "
+            "max_retries >= 0")
+    budget = float(_require(ref_raw, "extractor_max_budget_usd",
+                            (int, float), "literature.refresh"))
+    if budget <= 0:
+        raise ContractError(
+            "literature.refresh.extractor_max_budget_usd must be positive")
+    campaign_budget = ref_raw.get("extractor_max_campaign_budget_usd")
+    if campaign_budget is not None and (
+        isinstance(campaign_budget, bool)
+        or not isinstance(campaign_budget, (int, float)) or campaign_budget <= 0
+    ):
+        raise ContractError(
+            "literature.refresh.extractor_max_campaign_budget_usd must be a "
+            "positive number or null")
+    return LiteratureRefresh(
+        sources=sources, mailto=mailto, per_source_max=per_source_max,
+        max_papers=max_papers, max_retries=max_retries, extractor=extractor,
+        extractor_model=model, extractor_max_budget_usd=budget,
+        extractor_max_campaign_budget_usd=(
+            float(campaign_budget) if campaign_budget is not None else None),
+    )
+
+
 def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -432,9 +516,9 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         raise ContractError("contract root must be a mapping")
 
     schema_version = _require(raw, "schema_version", int, "")
-    if schema_version != 6:
+    if schema_version != 8:
         raise ContractError(f"unsupported contract schema_version {schema_version} "
-                            f"(this orchestrator expects 6)")
+                            f"(this orchestrator expects 8)")
 
     # Top-level whitelist (new in v4): an unknown block would previously be
     # ignored silently, so a typo like `refinment:` could disable a whole
@@ -580,6 +664,17 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         raise ContractError("pairwise_gate.judge_max_budget_usd must be positive")
 
     lit_raw = _require(raw, "literature", dict, "")
+    # Local unknown-key check (top-level whitelist can't see nested typos): a
+    # misspelled literature key would silently disable a subsystem or a 6b
+    # refresh setting. `refresh` (Phase 6b) is validated as its own sub-block.
+    known_lit_keys = {"enabled", "corpus_path", "retriever",
+                      "max_evidence_per_generation", "max_evidence_per_hypothesis",
+                      "max_queries", "stabilization_window", "citation_hops",
+                      "llm_max_budget_usd", "llm_max_campaign_budget_usd",
+                      "refresh"}
+    unknown_lit = sorted(set(lit_raw) - known_lit_keys)
+    if unknown_lit:
+        raise ContractError(f"contract: unknown literature keys {unknown_lit}")
     corpus_path = _require(lit_raw, "corpus_path", str, "literature")
     if corpus_path.startswith("/") or \
             ".." in PurePosixPath(corpus_path).parts:
@@ -594,10 +689,11 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         raise ContractError(
             "literature.corpus_path must live under literature/**")
     retriever = lit_raw.get("retriever", "lexical")
-    if retriever != "lexical":
+    if retriever not in SUPPORTED_RETRIEVERS:
         raise ContractError(
-            f"literature.retriever {retriever!r} is not implemented "
-            f"(Phase 3 supports: lexical)")
+            f"literature.retriever {retriever!r} not in {SUPPORTED_RETRIEVERS} "
+            f"(lexical = offline default; openalex/s2 = Phase 6b snapshot "
+            f"sources, campaign ranking stays lexical)")
     campaign_cap = lit_raw.get("llm_max_campaign_budget_usd")
     if campaign_cap is not None and (
         isinstance(campaign_cap, bool)
@@ -606,6 +702,7 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         raise ContractError(
             "literature.llm_max_campaign_budget_usd must be a positive "
             "number or null")
+    refresh = _parse_literature_refresh(lit_raw.get("refresh"))
     literature = Literature(
         enabled=_require(lit_raw, "enabled", bool, "literature"),
         corpus_path=corpus_path,
@@ -622,6 +719,7 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
             lit_raw, "llm_max_budget_usd", (int, float), "literature")),
         llm_max_campaign_budget_usd=(
             float(campaign_cap) if campaign_cap is not None else None),
+        refresh=refresh,
     )
     if min(literature.max_evidence_per_generation,
            literature.max_evidence_per_hypothesis,
@@ -1114,28 +1212,31 @@ class ProposalContext:
 
 
 _MECHANISMS = {
-    "lr_up": "Training appears optimizer-limited within the epoch budget; a "
-             "larger step size reaches a lower loss basin in the same number "
-             "of updates — until it crosses the stability threshold.",
-    "lr_down": "If the current step size overshoots along ill-conditioned "
-               "directions, a smaller one should converge more stably.",
-    "epochs_up": "The loss curve has not plateaued; more passes convert "
-                 "compute directly into fit.",
-    "feature_scaling": "Features have heterogeneous scales (condition number "
-                       "~625 unscaled); standardization equalizes curvature "
-                       "so a single global learning rate suits all "
-                       "coordinates.",
-    "momentum": "Heavy-ball momentum accelerates progress along "
-                "low-curvature directions; the effective step grows to "
-                "~lr/(1-beta), so it acts like a cheap lr increase with "
-                "smoothing.",
-    "l2": "If the train/held-out gap indicates variance, weight decay trades "
-          "a little bias for it.",
-    "batch_down": "Smaller batches take more update steps per epoch at "
-                  "similar gradient quality — more optimization progress per "
-                  "epoch.",
-    "batch_up": "Larger batches reduce gradient noise; helps iff noise, not "
-                "step count, is the binding constraint.",
+    "construction_toggle": "The starting tour sets the basin local search "
+                           "refines; a nearest-neighbor construction begins far "
+                           "closer to optimal than an arbitrary index order, so "
+                           "toggling it changes the reachable route quality.",
+    "iters_up": "Local search has not yet hit its convergence plateau; more "
+                "move evaluations convert compute directly into a shorter tour.",
+    "iters_down": "If the search converges well before the budget, spending "
+                  "fewer moves frees budget without losing tour quality.",
+    "restarts_up": "Independent multi-start restarts reduce the variance of the "
+                   "best tour found and lower the expected result, at a cost "
+                   "linear in the restart count.",
+    "temperature": "A higher initial acceptance temperature lets simulated "
+                   "annealing accept worsening moves early and escape local "
+                   "optima; too high wastes budget exploring worse tours.",
+    "cooling": "A slower geometric cooling keeps the temperature useful for "
+               "longer, helping when the move budget is large and hurting when "
+               "it is small.",
+    "segment_up": "A larger Or-opt segment neighborhood reaches relocations a "
+                  "smaller one cannot, at more cost per move.",
+    "segment_down": "A smaller segment neighborhood evaluates moves faster, "
+                    "trading reach for more moves within the budget.",
+    "perturb_up": "A stronger perturbation kick escapes deeper local optima "
+                  "between restarts, at the risk of discarding good structure.",
+    "perturb_down": "A gentler kick preserves more of the incumbent tour "
+                    "structure across an iterated-local-search restart.",
 }
 
 
@@ -1147,18 +1248,24 @@ def _round_sig(x: float, digits: int = 6) -> float:
 # vocabulary so progression certificates carry the same mechanism text as
 # their standard-step siblings. Set-valued params (momentum/l2) have kinds
 # but no step factor: they can bisect toward a boundary, never accelerate.
+# Set-valued params (initial_temperature, cooling_rate) are deliberately ABSENT:
+# they iterate a fixed tuple in _moves and never get progression bisection or a
+# squared accelerated step (a multiplicative kick over {0.99, 0.995, 0.999} is
+# meaningless). Same discipline as the prior domain's momentum/l2.
 _MOVE_KINDS = {
-    ("lr", "increase"): "lr_up", ("lr", "decrease"): "lr_down",
-    ("epochs", "increase"): "epochs_up",
-    ("batch_size", "increase"): "batch_up",
-    ("batch_size", "decrease"): "batch_down",
-    ("momentum", "increase"): "momentum", ("momentum", "decrease"): "momentum",
-    ("l2", "increase"): "l2", ("l2", "decrease"): "l2",
+    ("max_iterations", "increase"): "iters_up",
+    ("max_iterations", "decrease"): "iters_down",
+    ("restarts", "increase"): "restarts_up",
+    ("segment_max", "increase"): "segment_up",
+    ("segment_max", "decrease"): "segment_down",
+    ("perturbation_strength", "increase"): "perturb_up",
+    ("perturbation_strength", "decrease"): "perturb_down",
 }
 _STEP_FACTORS = {
-    ("lr", "increase"): 2.5, ("lr", "decrease"): 1 / 2.5,
-    ("epochs", "increase"): 2.0,
-    ("batch_size", "increase"): 2.0, ("batch_size", "decrease"): 0.5,
+    ("max_iterations", "increase"): 2.5, ("max_iterations", "decrease"): 1 / 2.5,
+    ("restarts", "increase"): 2.0,
+    ("perturbation_strength", "increase"): 2.0,
+    ("perturbation_strength", "decrease"): 0.5,
 }
 
 
@@ -1175,27 +1282,39 @@ class HeuristicProposer:
 
     def _moves(self, hp: dict) -> list[tuple[str, str, Any]]:
         moves: list[tuple[str, str, Any]] = []  # (kind, param, new_value)
-        moves.append(("feature_scaling", "feature_scaling", not hp["feature_scaling"]))
-        moves.append(("lr_up", "lr", _round_sig(float(hp["lr"]) * 2.5)))
-        moves.append(("epochs_up", "epochs", min(int(hp["epochs"]) * 2, 400)))
-        for beta in (0.9, 0.5, 0.95):
-            if not math.isclose(float(hp["momentum"]), beta):
-                moves.append(("momentum", "momentum", beta))
-        moves.append(("lr_down", "lr", _round_sig(float(hp["lr"]) / 2.5)))
-        moves.append(("batch_down", "batch_size", max(int(hp["batch_size"]) // 2, 4)))
-        for lam in (0.001, 0.0001, 0.01):
-            if not math.isclose(float(hp["l2"]), lam):
-                moves.append(("l2", "l2", lam))
-        moves.append(("batch_up", "batch_size", min(int(hp["batch_size"]) * 2, 256)))
+        moves.append(("construction_toggle", "use_nn_construction",
+                      not hp["use_nn_construction"]))
+        mi = int(hp["max_iterations"])
+        moves.append(("iters_up", "max_iterations", min(int(mi * 2.5), 500_000)))
+        moves.append(("iters_down", "max_iterations", max(int(mi / 2.5), 100)))
+        moves.append(("restarts_up", "restarts", min(int(hp["restarts"]) * 2, 64)))
+        # Set-valued acceptance knobs: a fixed tuple (incl. disabling SA at 0.0),
+        # never a multiplicative step (mirrors the prior momentum/l2 handling).
+        for temp in (0.0, 0.5, 1.0, 2.0):
+            if not math.isclose(float(hp["initial_temperature"]), temp):
+                moves.append(("temperature", "initial_temperature", temp))
+        for cool in (0.99, 0.995, 0.999):
+            if not math.isclose(float(hp["cooling_rate"]), cool):
+                moves.append(("cooling", "cooling_rate", cool))
+        sm = int(hp["segment_max"])
+        moves.append(("segment_up", "segment_max", min(sm + 1, 10)))
+        moves.append(("segment_down", "segment_max", max(sm - 1, 1)))
+        ps = int(hp["perturbation_strength"])
+        moves.append(("perturb_up", "perturbation_strength", min(ps * 2, 32)))
+        moves.append(("perturb_down", "perturbation_strength", max(ps // 2, 1)))
         return moves
 
     @staticmethod
     def _clamped(param: str, value: float) -> Any:
         """Apply the same per-param bounds `_moves` bakes into its steps."""
-        if param == "epochs":
-            return min(max(int(round(value)), 1), 400)
-        if param == "batch_size":
-            return min(max(int(round(value)), 4), 256)
+        if param == "max_iterations":
+            return min(max(int(round(value)), 100), 500_000)
+        if param == "restarts":
+            return min(max(int(round(value)), 1), 64)
+        if param == "segment_max":
+            return min(max(int(round(value)), 1), 10)
+        if param == "perturbation_strength":
+            return min(max(int(round(value)), 1), 32)
         return _round_sig(float(value))
 
     def _progression_moves(self, ctx: ProposalContext) -> list[tuple[str, str, Any]]:
@@ -1262,10 +1381,13 @@ class HeuristicProposer:
         for kind, param, new_value in raw_moves:
             if new_value == hp[param]:
                 continue
-            if isinstance(new_value, float) and (
-                param == "lr" and not 1e-5 <= new_value <= 5.0
-            ):
-                continue
+            if isinstance(new_value, float):
+                # Domain float bounds (progression bisection can drift): a
+                # cooling rate must stay in (0, 1); a temperature non-negative.
+                if param == "cooling_rate" and not 0.5 <= new_value < 1.0:
+                    continue
+                if param == "initial_temperature" and new_value < 0.0:
+                    continue
             if value_repr(new_value) in ctx.tested.get(param, []):
                 continue
             dedup = (param, value_repr(new_value))
@@ -1543,17 +1665,16 @@ class ClaudeProposer:
             f"- executor='coder' (at most {max_coder} per generation): a code "
             f"change under src/** implemented by a coding agent (set param "
             f"and new_value to null; write a concrete implementation_brief). "
-            f"The trainer may declare engineered features in "
-            f"artifacts/model.json as 'feature_spec': a list of terms, each "
-            f"a list of raw-feature indices multiplied together (e.g. "
-            f"[[0],[1],...,[7],[0,1]] adds an x0*x1 interaction input). The "
-            f"evaluator scores bias + weights . engineered_features. If the "
-            f"target relationship has structure a linear readout of raw "
-            f"features cannot capture, a coder hypothesis extending the "
-            f"feature spec is the only way to reach it.\n"
+            f"The solver in src/train.py reads instances (coordinates) and emits "
+            f"one tour per instance to artifacts/solution.json; a coder may "
+            f"change the search ALGORITHM itself — swap the NEIGHBORHOOD "
+            f"(2-opt -> Or-opt / 3-opt), add a move operator, change the "
+            f"acceptance rule (hill-climbing vs simulated annealing), add tabu "
+            f"memory, or change the construction. This is the only way to reach "
+            f"tours the hyperparameter patcher cannot.\n"
             f"- No two hypotheses on the same param; prefer mechanisms that "
-            f"attack DIFFERENT bottlenecks (optimization, model class, "
-            f"regularization).",
+            f"attack DIFFERENT bottlenecks (construction, neighborhood, "
+            f"acceptance, perturbation).",
         ]
         if feedback:
             parts.append(f"Your previous batch had problems: {feedback}. "
@@ -1667,7 +1788,9 @@ class ClaudeProposer:
         if isinstance(current, bool):
             if not isinstance(new_value, bool):
                 return f"{param} expects a boolean"
-        elif isinstance(current, int) and param in ("epochs", "batch_size"):
+        elif isinstance(current, int):
+            # Any integer-valued hyperparameter keeps integer values (bools are
+            # handled above). Domain-agnostic: was a hardcoded regression list.
             if isinstance(new_value, bool) or not isinstance(new_value, (int, float)):
                 return f"{param} expects an integer"
             new_value = int(round(new_value))
@@ -2021,18 +2144,18 @@ CODER_SYSTEM_PROMPT = (
     "- Keep training deterministic: fixed literal seeds only; never wall "
     "clock, os.urandom, or unseeded RNGs.\n"
     "- The entrypoint must remain `python src/train.py`, must honor "
-    "AUTORESEARCH_SMOKE=1 (clamp to <=2 epochs), and must finish well "
-    "within 90 seconds.\n"
+    "AUTORESEARCH_SMOKE=1 (clamp the search budget), and must finish well "
+    "within the dev budget.\n"
     "- Preserve the `# --- HYPERPARAMS-BEGIN/END ---` marker block and the "
     "HYPERPARAMS dict literal in src/train.py (other experiments patch it "
     "mechanically).\n"
-    "- artifacts/model.json must keep its schema: weights (finite floats), "
-    "bias, hyperparams echo, feature_means/feature_stds (iff "
-    "feature_scaling, matching the model input count), train_rmse, "
-    "train_seconds, schema_version; optionally feature_spec — a list of "
-    "engineered-feature terms, each a list of raw-feature indices whose "
-    "PRODUCT forms one model input (max 32 terms, degree <= 3). weights "
-    "length must equal the number of terms (8 raw features if no spec).\n"
+    "- The solver is handed the problem instances (city coordinates) via the "
+    "AUTORESEARCH_INSTANCES file path (falling back to the public training "
+    "instances when unset); it must emit artifacts/solution.json keeping its "
+    "schema: schema_version, solver (HYPERPARAMS echo), solutions (one tour per "
+    "instance_id — a permutation of range(n_cities) as a list of ints), and "
+    "solve_seconds. The trusted evaluator RECOMPUTES the tour length, so a "
+    "self-reported objective is ignored; return genuinely shorter valid tours.\n"
     "- Implement only the given hypothesis; keep the diff minimal and "
     "atomic."
 )
@@ -2332,12 +2455,12 @@ def distill_insight(record: dict) -> dict | None:
         follow_up = ("dev-split gains of this size may not generalize; "
                      "prefer interventions with a stronger mechanism")
         confidence = 0.6
-    elif fc in ("degenerate_weights", "no_skill"):
-        observation = (f"{desc} made training degenerate ({fc}); "
-                       f"optimization left the stable region.")
-        follow_up = (f"treat {to!r} as an upper bound for {param} in this regime"
+    elif fc in ("infeasible_solution", "no_skill"):
+        observation = (f"{desc} produced a {fc} result; the solver left the "
+                       f"feasible/skillful region.")
+        follow_up = (f"treat {to!r} as a boundary for {param} in this regime"
                      if param is not None else
-                     "this code direction destabilizes training")
+                     "this code direction breaks the solver")
         confidence = 0.9
     elif fc in ("timeout", "nonzero_exit"):
         observation = (f"{desc} made the run fail ({fc}) despite a valid "
@@ -2347,14 +2470,14 @@ def distill_insight(record: dict) -> dict | None:
                      "keep code changes within the training budget")
         confidence = 0.7
     elif verdict == "valid_negative":
-        observation = (f"{desc} regressed heldout_rmse "
+        observation = (f"{desc} regressed mean_tour_length "
                        f"{before_txt}->{primary_txt}; rejected.")
         follow_up = (f"deprioritize this direction for {param}"
                      if param is not None else
                      "deprioritize this code direction")
         confidence = 0.7
     elif verdict == "valid_inconclusive":
-        observation = (f"{desc} changed heldout_rmse "
+        observation = (f"{desc} changed mean_tour_length "
                        f"{before_txt}->{primary_txt}, below the "
                        f"min_relative_improvement threshold.")
         follow_up = "not the binding constraint near this optimum"
@@ -2370,7 +2493,7 @@ def distill_insight(record: dict) -> dict | None:
 
     return {
         "insight_id": f"ins_{record.get('run_id', '?')}",
-        "scope": "synthetic heteroscale regression (hyperparams + src/** code)",
+        "scope": "euclidean TSP heuristics (search hyperparams + src/** code)",
         "round": record.get("round"),
         "generation": record.get("generation"),
         "hypothesis_id": hyp.get("id"),
@@ -2483,7 +2606,7 @@ def replay_ledger_fields(state: dict, records: list[dict]) -> None:
 
 # Endpoints that made a validly-implemented run infeasible mark a boundary
 # for bisection (the failing value is remembered as `boundary_to`).
-_INFEASIBILITY_CLASSES = {"degenerate_weights", "no_skill", "timeout",
+_INFEASIBILITY_CLASSES = {"infeasible_solution", "no_skill", "timeout",
                           "nonzero_exit"}
 
 
@@ -3693,7 +3816,20 @@ def _load_evaluator_declarations() -> dict:
         "split_names": tuple(module.SPLIT_NAMES),
         "max_test_seeds": int(module.MAX_TEST_SEEDS),
         "sandbox_backends": tuple(module.SUPPORTED_SANDBOX_BACKENDS),
+        "n_cities": int(module.N_CITIES),
     }
+
+
+def _load_dataset_declarations() -> dict:
+    """Load the dataset generator's public constants by absolute path (never via
+    sys.path), for the init-time N_CITIES cross-check."""
+    spec = importlib.util.spec_from_file_location(
+        "autoresearch_dataset_decls", ROOT / "evaluation" / "dataset.py")
+    if spec is None or spec.loader is None:
+        raise OrchestratorError("cannot import evaluation/dataset.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return {"n_cities": int(module.N_CITIES)}
 
 
 def _sandbox_preflight(contract: ResearchContract) -> None:
@@ -3738,6 +3874,21 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"[init] literature corpus {corpus.corpus_id}: "
               f"{len(corpus.papers)} papers, {len(corpus.claims)} claims "
               f"(sha256 {corpus.sha256[:12]})")
+        # Phase 6b: fail fast at init (not just at campaign build) if the
+        # contract selects a real source but the frozen snapshot wasn't built
+        # by it. Unlike the sandbox-backend cross-check (constant in the
+        # protected evaluate.py), SUPPORTED_RETRIEVERS lives in the protected
+        # literature/engine.py — the evaluator never reads literature/, so the
+        # retriever is not one of its trust concerns.
+        rtr = contract.literature.retriever
+        if rtr in ("openalex", "s2"):
+            prov = corpus.provenance or {}
+            src = {s for s in str(prov.get("source", "")).split("+") if s}
+            if rtr not in src:
+                raise ContractError(
+                    f"literature.retriever {rtr!r} but corpus provenance source "
+                    f"is {prov.get('source')!r}; `ground --refresh --source "
+                    f"{rtr}` to build a matching snapshot")
 
     declared = _load_evaluator_declarations()
     if (declared["budgets"].get("smoke") != contract.budgets.smoke_train_timeout_s
@@ -3783,6 +3934,15 @@ def cmd_init(args: argparse.Namespace) -> int:
             f"{contract.sandbox.backend!r} but the evaluator supports "
             f"{declared['sandbox_backends']}"
         )
+    # Phase 6c: the evaluator's N_CITIES must agree with the dataset generator's
+    # (same hardcode + cross-check discipline). The evaluator declaration already
+    # cross-checks itself against dataset.N_CITIES at eval time; this fails fast
+    # at init so a mismatched instance size cannot reach a campaign.
+    ds_n_cities = int(_load_dataset_declarations()["n_cities"])
+    if declared["n_cities"] != ds_n_cities:
+        raise ContractError(
+            f"N_CITIES drift: evaluator {declared['n_cities']} vs dataset "
+            f"{ds_n_cities}")
     # Fail closed BEFORE any git work or baseline spend if the container
     # backend's daemon/image is not ready.
     _sandbox_preflight(contract)
@@ -3810,7 +3970,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         dev_seed, gate_seed = ordered[0], ordered[1]
         test_seeds = ordered[2:]
         atomic_write_json(HELDOUT_CONFIG_PATH, {
-            "schema_version": 3,
+            "schema_version": 4,
             "splits": {
                 "dev": {"seed": dev_seed},
                 "gate": {"seed": gate_seed},
@@ -4191,10 +4351,10 @@ def _reviewer_raw_test(baseline_metrics: list[dict],
     scores (gate blindness holds by construction in the reviewer packet)."""
     def row(m: dict) -> dict:
         mm = m.get("metrics") or {}
-        return {"heldout_rmse": mm.get("heldout_rmse"),
-                "train_rmse": mm.get("train_rmse_recomputed"),
-                "generalization_gap": mm.get("generalization_gap"),
-                "n_examples": (m.get("dataset") or {}).get("n_heldout"),
+        return {"mean_tour_length": mm.get("mean_tour_length"),
+                "mean_gap_to_nn": mm.get("mean_gap_to_nn"),
+                "solve_seconds": mm.get("solve_seconds"),
+                "n_instances": (m.get("dataset") or {}).get("n_instances"),
                 "failure_class": m.get("failure_class")}
     per_seed = [{"seed_index": k, "baseline": row(baseline_metrics[k]),
                  "incumbent": row(incumbent_metrics[k])}
@@ -4603,10 +4763,109 @@ def cmd_approve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_refresh_cfg(base: "LiteratureRefresh",
+                         args: argparse.Namespace) -> "LiteratureRefresh":
+    """Merge the contract's literature.refresh block with `ground --refresh` CLI
+    overrides (contract decides defaults, CLI decides HOW for this run)."""
+    source_arg = getattr(args, "source", "contract") or "contract"
+    if source_arg == "contract":
+        sources = base.sources
+    elif source_arg == "both":
+        sources = ("openalex", "s2")
+    else:
+        sources = (source_arg,)
+    return dataclasses.replace(
+        base,
+        sources=sources,
+        extractor=getattr(args, "extractor", None) or base.extractor,
+        max_papers=getattr(args, "max_papers", None) or base.max_papers,
+        mailto=(getattr(args, "mailto", None)
+                if getattr(args, "mailto", None) is not None else base.mailto),
+    )
+
+
+def cmd_ground_refresh(args: argparse.Namespace) -> int:
+    """Phase 6b MAINTENANCE: fetch real papers (OpenAlex/S2), LLM-extract
+    claim-level evidence, and write a FROZEN corpus snapshot under literature/.
+
+    This is NOT a campaign op: `literature.sources` (the network + LLM code) is
+    imported lazily HERE so it never lands on the deterministic `run` path, and
+    the orchestrator — not the literature package — writes the snapshot, so the
+    literature no-runtime-write invariant holds. After refresh the operator
+    reviews the tag diff, then `init --force` re-hashes + re-baselines."""
+    contract = load_contract()
+    if not contract.literature.enabled:
+        raise OrchestratorError("literature is disabled in the contract")
+    base = contract.literature.refresh
+    if base is None:
+        raise OrchestratorError(
+            "literature.refresh is not configured in the contract; add a "
+            "`refresh:` block before running `ground --refresh`")
+    cfg = _resolve_refresh_cfg(base, args)
+
+    snapshot_path = ROOT / contract.literature.corpus_path
+    # Protected files ship read-only (0o444). Refuse rather than crash mid-write.
+    target = snapshot_path if snapshot_path.exists() else snapshot_path.parent
+    if not os.access(target, os.W_OK):
+        raise OrchestratorError(
+            f"{snapshot_path} is not writable (protected files are 0o444). Run "
+            f"`chmod u+w {contract.literature.corpus_path}` first, then re-run; "
+            f"after refresh run `init --force` to re-hash and re-baseline.")
+
+    # Lazy import keeps the network/LLM module off the campaign path (canary).
+    from literature import sources as lit_sources
+
+    print(f"[refresh] sources={list(cfg.sources)} extractor={cfg.extractor} "
+          f"max_papers={cfg.max_papers} (this makes live API calls)")
+    try:
+        corpus_dict = lit_sources.build_corpus_snapshot(cfg, fetched_utc=utc_now())
+    except lit_sources.SourceError as exc:
+        raise OrchestratorError(f"refresh failed: {exc}") from None
+
+    # Validate BEFORE overwriting: a refresh that produced an unloadable corpus
+    # must leave the existing snapshot intact.
+    payload = json.dumps(corpus_dict, indent=2, sort_keys=True) + "\n"
+    tmp = snapshot_path.with_name(snapshot_path.name + ".refresh.tmp")
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(payload, encoding="utf-8")
+    try:
+        corpus = load_corpus(tmp)
+    except CorpusError as exc:
+        tmp.unlink(missing_ok=True)
+        raise OrchestratorError(
+            f"refresh produced an invalid corpus (old snapshot kept): {exc}"
+        ) from None
+    os.replace(tmp, snapshot_path)
+
+    prov = corpus_dict["provenance"]
+    counts = prov["counts"]
+    print(f"[refresh] wrote {contract.literature.corpus_path}: "
+          f"{counts['papers']} papers, {counts['claims']} claims "
+          f"(sha256 {corpus.sha256[:12]}, extractor {prov['extractor_mode']}, "
+          f"cost ${prov['extractor_cost_usd']:.4f})")
+    # The human tag-diff review gate: surface exactly the support-granting claims
+    # (effect=improves) and any injection-flagged papers for manual review before
+    # the snapshot is frozen with `init --force`.
+    supports = [c for c in corpus_dict["claims"]
+                if c["tags"]["effect"] == "improves"]
+    print(f"[refresh] REVIEW BEFORE FREEZE: {len(supports)} support-granting "
+          f"(effect=improves) claims; {counts['injection_flagged_papers']} "
+          f"injection-flagged paper(s); {counts['dropped_claims_policy']} claims "
+          f"dropped by content policy.")
+    for c in supports:
+        print(f"  supports: {c['paper_id']} "
+              f"[{c['tags']['intervention']}/{c['tags']['move']}] {c['claim'][:80]}")
+    print("[refresh] next: review the claims above, then "
+          "`chmod u-w` (optional) and `python orchestrator.py init --force`.")
+    return 0
+
+
 def cmd_ground(args: argparse.Namespace) -> int:
     """One-shot research-question grounding certificate (Blueprint Layer 2
     output). Runs the evidence flow against the contract objective (no
     hypotheses) and persists the certificate under experiments/evidence/."""
+    if getattr(args, "refresh", False):
+        return cmd_ground_refresh(args)
     contract = load_contract()
     if not contract.literature.enabled:
         raise OrchestratorError("literature is disabled in the contract")
@@ -4706,6 +4965,25 @@ def main() -> int:
                           default="lexical")
     p_ground.add_argument("--model", default=None,
                           help="model override for the claude analyst")
+    # Phase 6b MAINTENANCE: fetch real papers and rebuild the corpus snapshot.
+    p_ground.add_argument("--refresh", action="store_true",
+                          help="MAINTENANCE: fetch live papers (OpenAlex/S2), "
+                               "LLM-extract claims, write a frozen corpus "
+                               "snapshot under literature/ (not a campaign op; "
+                               "run `init --force` afterward)")
+    p_ground.add_argument("--source",
+                          choices=("contract", "openalex", "s2", "both"),
+                          default="contract",
+                          help="override literature.refresh.sources for this "
+                               "refresh (default: use the contract)")
+    p_ground.add_argument("--extractor", choices=("claude", "deterministic"),
+                          default=None,
+                          help="override the refresh extractor (default: "
+                               "contract)")
+    p_ground.add_argument("--max-papers", type=int, default=None,
+                          help="override literature.refresh.max_papers")
+    p_ground.add_argument("--mailto", default=None,
+                          help="OpenAlex polite-pool email for this refresh")
     p_ground.set_defaults(fn=cmd_ground)
 
     p_verify = sub.add_parser("verify-protection",

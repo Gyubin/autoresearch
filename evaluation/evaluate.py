@@ -1,47 +1,45 @@
 #!/usr/bin/env python3
-"""Protected mock evaluator for AutoResearch Phase 1.
+"""Protected evaluator for the Phase 6c Euclidean-TSP research domain.
 
 PROTECTED FILE (listed in research_contract.yaml protected_globs).
 
 Trust model / invariants:
   * Only the ROOT copy of this file is authoritative. The orchestrator always
-    invokes <root>/evaluation/evaluate.py and points it at a candidate
-    workspace via --workspace; copies of evaluation/ inside worktrees are
-    never executed for scoring.
-  * This evaluator trusts nothing outside evaluation/** (plus a hash-only
-    echo of the contract):
-      - budgets are hardcoded here; `orchestrator.py init` cross-checks them
-        against research_contract.yaml once and fails fast on drift;
-      - held-out seeds (three splits: dev for search, gate for blind
-        admission, test untouched until the campaign-end report) come from
-        evaluation/heldout_config.json next to THIS file, never from the
-        workspace;
-      - dataset code is loaded from THIS directory by absolute file path, so
-        workspace code can never enter the evaluator's import path.
-  * Phase 6a (Blueprint Layer 5): the candidate trainer's EXECUTION is
-    delegated to a sandbox (sandbox/runner.py, loaded from THIS repo by
-    absolute file path, never via sys.path). The default `subprocess` backend
-    is the historical host subprocess (no OS isolation); the `container`
-    backend runs train.py under `docker run` with no network, a read-only
-    rootfs, dropped capabilities, resource limits, an ephemeral PID namespace,
-    and the held-out seed file masked out of the mount. SCORING never enters
-    the sandbox — the seeds stay in this trusted process only — so isolated
-    candidate code cannot read them regardless of the workspace path. The
-    backend/limits arrive as CLI flags from the (trusted) orchestrator and are
-    echoed back into metrics for provenance and drift detection.
-  * The train subprocess gets a from-scratch environment (PATH,
-    PYTHONHASHSEED=0, optional AUTORESEARCH_SMOKE) and `-s -B` flags. The
-    orchestrator's --nonce is echoed into metrics but never exported to the
-    train subprocess, so candidate code cannot pre-craft a metrics file that
-    passes the orchestrator's nonce check. (-I/-E are deliberately NOT used:
-    they would make Python ignore PYTHONHASHSEED.)
-  * The subprocess runs in its own session (start_new_session=True); on
-    timeout the whole process group is SIGKILLed so grandchildren cannot
-    outlive the budget.
+    invokes <root>/evaluation/evaluate.py and points it at a candidate workspace
+    via --workspace; copies of evaluation/ inside worktrees are never executed
+    for scoring.
+  * This evaluator trusts nothing outside evaluation/** (plus a hash-only echo of
+    the contract): budgets/metric identity are hardcoded here and cross-checked
+    against research_contract.yaml at `orchestrator.py init`; the held-out seeds
+    (dev/gate/test) come from evaluation/heldout_config.json next to THIS file;
+    dataset code is loaded from THIS directory by absolute path.
+
+  * Phase 6c compute-boundary (the domain shift from regression):
+      - The task is combinatorial: the candidate is a SOLVER that must run on the
+        held-out instances. The evaluator generates the split's instances from
+        the hidden seed (TRUSTED), hands the solver ONLY the coordinates (never
+        the seed; instance ids are opaque) via the sandbox, and the solver emits
+        a tour per instance.
+      - The evaluator then VALIDATES each tour is a permutation and RECOMPUTES
+        the tour length ITSELF. The solver's self-reported objective is ignored,
+        so a forged score cannot inflate a result. Seeds stay in this trusted
+        process, still masked out of the container, so a solver cannot regenerate
+        other splits.
+      - Because the candidate now executes on held-out instances, gate/test
+        admission is only fully trustworthy under the CONTAINER backend (the
+        subprocess backend has no FS isolation and can read the seed file by
+        absolute path). subprocess stays the Docker-free default for dev/smoke
+        and tests; the orchestrator warns when it is used for gate/report.
+
+  * Phase 6a execution sandbox unchanged: the solver runs under sandbox/runner.py
+    (loaded from THIS repo by absolute path); the container backend runs it with
+    no network, a read-only rootfs, dropped capabilities, resource limits, an
+    ephemeral PID namespace, and the held-out seed file / gate ledger masked.
+
   * Exit code convention: exit 0 iff a metrics file was written. Scientific
-    failures (timeout, crash, degenerate weights, no-skill) still exit 0 with
-    executed/degenerate/failure_class set. A nonzero exit means evaluator
-    infrastructure itself broke and the round must be treated as unscored.
+    failures (timeout, crash, infeasible solution, no-skill) still exit 0 with
+    executed/failure_class set. A nonzero exit means evaluator infrastructure
+    itself broke and the round must be treated as unscored.
 """
 
 from __future__ import annotations
@@ -59,37 +57,29 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-EVALUATOR_VERSION = "1.2.0"
-METRICS_SCHEMA_VERSION = "1.2"
+EVALUATOR_VERSION = "2.0.0"
+METRICS_SCHEMA_VERSION = "2.0"
 
-# Hardcoded budgets and metric identity — see trust model above. The
-# orchestrator cross-checks ALL of these against the contract at init and on
-# every evaluation, so contract edits cannot silently invert classification.
-TRAIN_TIMEOUT_S = {"smoke": 20, "dev": 90}
-PRIMARY_METRIC_NAME = "heldout_rmse"
+# Hardcoded budgets and metric identity — see trust model above. The orchestrator
+# cross-checks ALL of these against the contract at init and on every evaluation.
+TRAIN_TIMEOUT_S = {"smoke": 30, "dev": 120}
+PRIMARY_METRIC_NAME = "mean_tour_length"
 PRIMARY_METRIC_DIRECTION = "minimize"
 SPLIT_NAMES = ("dev", "gate", "test")
 
-# Phase 5: upper bound on hidden test seeds for multi-seed finalist
-# reproduction. Must equal MAX_FINALIST_SEEDS in orchestrator.py; `init`
-# cross-checks the two (and that finalist_seeds <= this bound) and fails fast
-# on drift. It also bounds the per-invocation seed index the evaluator honors.
+# Phase 5: upper bound on hidden test seeds for multi-seed finalist reproduction.
+# Must equal MAX_FINALIST_SEEDS in orchestrator.py; `init` cross-checks the two.
 MAX_TEST_SEEDS = 16
 
 # Phase 6a: execution-sandbox backends this evaluator will honor. Must equal
-# SUPPORTED_BACKENDS in sandbox/runner.py; `orchestrator.py init` cross-checks
-# this declaration against the contract's chosen backend and fails on drift.
+# SUPPORTED_BACKENDS in sandbox/runner.py; `orchestrator.py init` cross-checks.
 SUPPORTED_SANDBOX_BACKENDS = ("subprocess", "container")
+
+# Phase 6c: cities per instance. Cross-checked against dataset.N_CITIES at init.
+N_CITIES = 60
 
 MAX_ARTIFACT_BYTES = 1_000_000
 TAIL_BYTES = 2048
-
-# Declarative engineered-feature bounds: candidates may declare model inputs
-# as products of raw features (e.g. [0, 1] -> x0*x1) in artifacts/model.json.
-# This widens the model class WITHOUT ever executing candidate code inside
-# the evaluator — the spec is data, validated like the weights.
-MAX_FEATURE_TERMS = 32
-MAX_TERM_DEGREE = 3
 
 EVAL_DIR = Path(__file__).resolve().parent
 ROOT_DIR = EVAL_DIR.parent
@@ -121,9 +111,7 @@ _SANDBOX_MODULE = None
 
 def _load_sandbox_module():
     """Load the ROOT sandbox runner by absolute path (never via sys.path), so a
-    workspace copy can never shadow the isolation code. Cached: one evaluator
-    process runs a single evaluation, but the config build and the run share it
-    (identical SandboxConfig class)."""
+    workspace copy can never shadow the isolation code."""
     global _SANDBOX_MODULE
     if _SANDBOX_MODULE is None:
         spec = importlib.util.spec_from_file_location(
@@ -132,9 +120,6 @@ def _load_sandbox_module():
         if spec is None or spec.loader is None:
             raise RuntimeError("failed to build import spec for sandbox/runner.py")
         module = importlib.util.module_from_spec(spec)
-        # Register before exec: @dataclasses.dataclass (Py 3.14) resolves the
-        # class module via sys.modules during processing, so an unregistered
-        # module raises AttributeError.
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         _SANDBOX_MODULE = module
@@ -147,14 +132,6 @@ def _tail(path: Path) -> str:
     except OSError:
         return ""
     return data[-TAIL_BYTES:].decode("utf-8", errors="replace")
-
-
-def _is_finite_number(x: object) -> bool:
-    return (
-        isinstance(x, (int, float))
-        and not isinstance(x, bool)
-        and math.isfinite(x)
-    )
 
 
 def _sanitize(obj: object) -> object:
@@ -181,14 +158,44 @@ def _workspace_commit(workspace: Path) -> str | None:
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
-def _run_train(workspace: Path, mode: str, log_dir: Path, sandbox_cfg,
-               run_id: str, split: str, seed_index: int | None):
-    """Run the candidate trainer via the configured sandbox.
+def _atomic_write(out_path: Path, payload: str) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_name(out_path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, out_path)
 
-    The evaluator remains the sole authority on the from-scratch environment;
-    the sandbox only decides HOW that command is isolated. Returns the
-    sandbox's TrainResult (exit_code, timed_out, stdout/stderr paths,
-    artifacts_dir, isolated, backend, infra_error)."""
+
+# ---------------------------------------------------------------------------
+# Trusted TSP scoring primitives (never import candidate code)
+# ---------------------------------------------------------------------------
+
+def _tour_length(perm: list[int], coords: list[list[int]], euclid) -> int:
+    n = len(perm)
+    return sum(euclid(coords[perm[i]], coords[perm[(i + 1) % n]])
+               for i in range(n))
+
+
+def _nearest_neighbor(coords: list[list[int]], euclid) -> list[int]:
+    """Trusted reference construction for the skill floor / gap metric."""
+    n = len(coords)
+    unvisited = set(range(1, n))
+    tour = [0]
+    while unvisited:
+        last = tour[-1]
+        nxt = min(unvisited, key=lambda c: euclid(coords[last], coords[c]))
+        tour.append(nxt)
+        unvisited.discard(nxt)
+    return tour
+
+
+def _run_train(workspace: Path, mode: str, log_dir: Path, sandbox_cfg,
+               run_id: str, split: str, seed_index: int | None,
+               instances_path: Path):
+    """Run the candidate solver via the configured sandbox on the split's
+    instances (coordinates only, no seed). Returns the sandbox's TrainResult."""
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "PYTHONHASHSEED": "0",
@@ -201,186 +208,58 @@ def _run_train(workspace: Path, mode: str, log_dir: Path, sandbox_cfg,
     seed_tag = f"-s{seed_index}" if seed_index is not None else ""
     name_hint = f"{run_id}-{split}{seed_tag}"
     return sandbox.run_train(workspace, mode, env, TRAIN_TIMEOUT_S[mode],
-                             log_dir, name_hint)
+                             log_dir, name_hint, instances_path=instances_path)
 
 
 def _load_artifact(artifacts_dir: Path, notes: list[str]) -> tuple[dict | None, str | None]:
-    """Validate and load model.json from the sandbox's artifacts dir. Returns
-    (artifact, failure_class). For the subprocess backend this is
-    <workspace>/artifacts; for the container backend it is the fresh host dir
-    that was bind-mounted rw into the container (the seed-bearing repo tree is
-    never that dir)."""
-    artifact_path = artifacts_dir / "model.json"
+    """Validate + load solution.json from the sandbox's artifacts dir. Returns
+    (artifact, failure_class). Structural problems are malformed_solution."""
+    artifact_path = artifacts_dir / "solution.json"
     if artifact_path.is_symlink():
         notes.append("artifact is a symlink; rejected")
-        return None, "malformed_artifact"
+        return None, "malformed_solution"
     if not artifact_path.is_file():
         return None, "missing_artifact"
     if artifact_path.stat().st_size > MAX_ARTIFACT_BYTES:
         notes.append(f"artifact exceeds {MAX_ARTIFACT_BYTES} bytes; rejected")
-        return None, "malformed_artifact"
+        return None, "malformed_solution"
     try:
         artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         notes.append(f"artifact unreadable: {exc}")
-        return None, "malformed_artifact"
+        return None, "malformed_solution"
     if not isinstance(artifact, dict):
         notes.append("artifact is not a JSON object")
-        return None, "malformed_artifact"
+        return None, "malformed_solution"
     return artifact, None
 
 
-def _validate_feature_spec(
-    spec: object, n_features: int, notes: list[str]
-) -> list[list[int]] | None:
-    """Validate the declarative engineered-feature spec (pure data).
+def _validate_solutions(
+    instances: list[dict], solutions: object, n_cities: int, notes: list[str]
+) -> tuple[list[list[int]] | None, str | None]:
+    """Validate one tour per instance as pure data. Returns (perms, failure).
 
-    Each term is a list of raw-feature indices whose product forms one model
-    input; None (absent) means the identity spec — one term per raw feature —
-    which keeps Phase 1 artifacts scoring identically.
-    """
-    if spec is None:
-        return [[j] for j in range(n_features)]
-    if not isinstance(spec, list) or not 1 <= len(spec) <= MAX_FEATURE_TERMS:
-        notes.append(f"feature_spec must be a list of 1..{MAX_FEATURE_TERMS} terms")
-        return None
-    validated: list[list[int]] = []
-    for term in spec:
-        if (
-            not isinstance(term, list)
-            or not 1 <= len(term) <= MAX_TERM_DEGREE
-            or not all(
-                isinstance(i, int) and not isinstance(i, bool)
-                and 0 <= i < n_features
-                for i in term
-            )
-        ):
-            notes.append(f"invalid feature term: {term!r}")
-            return None
-        validated.append([int(i) for i in term])
-    return validated
-
-
-def _validate_model(
-    artifact: dict, n_features: int, notes: list[str]
-) -> tuple[dict | None, str | None]:
-    """Extract a scoreable model from the artifact.
-
-    Returns (model, failure_class); non-finite weights are a *degenerate*
-    outcome (divergence is scientific evidence), structural problems are
-    malformed_artifact.
-    """
-    spec = _validate_feature_spec(artifact.get("feature_spec"), n_features, notes)
-    if spec is None:
-        return None, "malformed_artifact"
-
-    weights = artifact.get("weights")
-    bias = artifact.get("bias")
-    if (
-        not isinstance(weights, list)
-        or len(weights) != len(spec)
-        or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in weights)
-        or not isinstance(bias, (int, float))
-        or isinstance(bias, bool)
-    ):
-        notes.append("weights/bias missing or wrong shape for the feature spec")
-        return None, "malformed_artifact"
-
-    hp = artifact.get("hyperparams")
-    if not isinstance(hp, dict):
-        notes.append("hyperparams echo missing")
-        return None, "malformed_artifact"
-
-    scaling = bool(hp.get("feature_scaling"))
-    means = artifact.get("feature_means")
-    stds = artifact.get("feature_stds")
-    if scaling:
-        ok = (
-            isinstance(means, list)
-            and isinstance(stds, list)
-            and len(means) == len(spec)
-            and len(stds) == len(spec)
-            and all(_is_finite_number(v) for v in means)
-            and all(_is_finite_number(v) and v != 0.0 for v in stds)
-        )
-        if not ok:
-            notes.append("feature_scaling=True but scaling stats invalid")
-            return None, "malformed_artifact"
-
-    if not all(math.isfinite(v) for v in weights) or not math.isfinite(bias):
-        notes.append("non-finite weights/bias (training diverged)")
-        return None, "degenerate_weights"
-
-    return {
-        "weights": [float(v) for v in weights],
-        "bias": float(bias),
-        "spec": spec,
-        "scaling": scaling,
-        "means": means,
-        "stds": stds,
-    }, None
-
-
-def _engineer(x: list[float], spec: list[list[int]]) -> list[float]:
-    out = []
-    for term in spec:
-        v = 1.0
-        for i in term:
-            v *= x[i]
-        out.append(v)
-    return out
-
-
-def _predict_rmse(
-    model: dict, xs: list[list[float]], ys: list[float], n_features: int
-) -> float | None:
-    """RMSE of the model on (xs, ys); None if predictions go non-finite."""
-    w = model["weights"]
-    b = model["bias"]
-    spec = model["spec"]
-    k = len(spec)
-    phi = [_engineer(x, spec) for x in xs]
-    if model["scaling"]:
-        m, s = model["means"], model["stds"]
-        phi = [[(row[j] - m[j]) / s[j] for j in range(k)] for row in phi]
-    sse = 0.0
-    for row, y in zip(phi, ys):
-        pred = b + sum(w[j] * row[j] for j in range(k))
-        if not math.isfinite(pred):
-            return None
-        d = pred - y
-        sse += d * d
-    if not math.isfinite(sse):
-        return None
-    return math.sqrt(sse / len(ys))
-
-
-def _predict_sq_errors(
-    model: dict, xs: list[list[float]], ys: list[float]
-) -> list[float] | None:
-    """Per-example squared errors; None if any prediction goes non-finite.
-
-    Phase 5: the paired bootstrap pairs baseline vs incumbent squared errors
-    example-by-example on the same test dataset. Emitted only for the test
-    split (dev/gate metrics surfaces are unchanged). sqrt(mean(errors)) equals
-    the scalar heldout_rmse by construction (cross-checked in the stats layer).
-    """
-    w = model["weights"]
-    b = model["bias"]
-    spec = model["spec"]
-    k = len(spec)
-    phi = [_engineer(x, spec) for x in xs]
-    if model["scaling"]:
-        m, s = model["means"], model["stds"]
-        phi = [[(row[j] - m[j]) / s[j] for j in range(k)] for row in phi]
-    errors: list[float] = []
-    for row, y in zip(phi, ys):
-        pred = b + sum(w[j] * row[j] for j in range(k))
-        if not math.isfinite(pred):
-            return None
-        d = pred - y
-        errors.append(d * d)
-    return errors
+    A missing/ill-typed `solutions` object is malformed_solution (structural); a
+    well-formed entry that is not a permutation of range(n_cities) is
+    infeasible_solution (a scientific verdict — the solver produced an answer,
+    just an invalid one)."""
+    if not isinstance(solutions, dict):
+        notes.append("solutions is not an object")
+        return None, "malformed_solution"
+    target = set(range(n_cities))
+    perms: list[list[int]] = []
+    for inst in instances:
+        perm = solutions.get(inst["instance_id"])
+        if (not isinstance(perm, list) or len(perm) != n_cities
+                or not all(isinstance(x, int) and not isinstance(x, bool)
+                           for x in perm)
+                or set(perm) != target):
+            notes.append(
+                f"instance {inst['instance_id']}: not a permutation of "
+                f"range({n_cities})")
+            return None, "infeasible_solution"
+        perms.append(perm)
+    return perms, None
 
 
 def evaluate(workspace: Path, mode: str, split: str, run_id: str, nonce: str,
@@ -399,8 +278,6 @@ def evaluate(workspace: Path, mode: str, split: str, run_id: str, nonce: str,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "workspace": str(workspace),
         "workspace_commit": _workspace_commit(workspace),
-        # Phase 6a provenance: which isolation backend ran the candidate. The
-        # orchestrator echo-checks this against the backend it requested.
         "sandbox": {
             "backend": sandbox_cfg.backend,
             "image": sandbox_cfg.image,
@@ -430,7 +307,7 @@ def evaluate(workspace: Path, mode: str, split: str, run_id: str, nonce: str,
             "value": None,
         },
         "metrics": {},
-        "hyperparams": None,
+        "solver": None,
         "train_exit_code": None,
         "stdout_tail": "",
         "stderr_tail": "",
@@ -449,19 +326,46 @@ def evaluate(workspace: Path, mode: str, split: str, run_id: str, nonce: str,
         notes.append("heldout_config.json missing — run `orchestrator.py init` first")
         return done()
 
+    ds = _load_dataset_module()
+    if ds.N_CITIES != N_CITIES:
+        metrics["failure_class"] = "evaluator_error"
+        notes.append(f"N_CITIES drift: evaluator {N_CITIES} vs dataset {ds.N_CITIES}")
+        return done()
+
+    effective_index = seed_index or 0
+    if split == "test" and effective_index >= MAX_TEST_SEEDS:
+        metrics["failure_class"] = "evaluator_error"
+        notes.append(f"seed_index {effective_index} exceeds MAX_TEST_SEEDS "
+                     f"{MAX_TEST_SEEDS}")
+        return done()
+
+    # Generate the split's instances (TRUSTED, from the hidden seed) and hand the
+    # solver ONLY the coordinates + opaque ids — never the seed.
+    instances = ds.load_split(HELDOUT_CONFIG, split, effective_index)
+    handoff = [{"instance_id": i["instance_id"], "coords": i["coords"]}
+               for i in instances]
+    instances_path = out_path.parent / f"instances_{mode}_{split}_s{effective_index}.json"
+    _atomic_write(instances_path, json.dumps(handoff, sort_keys=True))
+
+    metrics["dataset"] = {
+        "split": split,
+        "seed_index": effective_index,
+        "n_instances": len(instances),
+        "n_cities": N_CITIES,
+        # Proves which instances scored a run (and catches libm drift) without
+        # leaking the seed.
+        "instances_fingerprint": ds.fingerprint(ds.flat_coords(instances)),
+    }
+
     train_started = time.perf_counter()
     train = _run_train(workspace, mode, out_path.parent, sandbox_cfg,
-                       run_id, split, seed_index)
+                       run_id, split, seed_index, instances_path)
     metrics["budget"]["train_seconds"] = round(time.perf_counter() - train_started, 3)
     metrics["train_exit_code"] = train.exit_code
     metrics["stdout_tail"] = _tail(train.stdout_path)
     metrics["stderr_tail"] = _tail(train.stderr_path)
 
     if train.infra_error:
-        # The sandbox itself failed to launch the container (docker/OCI exit
-        # 125/126/127) — an evaluator-infrastructure fault, not a candidate
-        # verdict. Raise so main() reports it loudly and exits nonzero; the
-        # orchestrator then treats the round as unscored, never a science result.
         raise RuntimeError(
             f"sandbox container failed to launch (docker exit "
             f"{train.exit_code}); see stderr tail: {metrics['stderr_tail'][-500:]}")
@@ -469,7 +373,7 @@ def evaluate(workspace: Path, mode: str, split: str, run_id: str, nonce: str,
     exit_code, timed_out = train.exit_code, train.timed_out
     if timed_out:
         metrics["failure_class"] = "timeout"
-        notes.append(f"train exceeded {TRAIN_TIMEOUT_S[mode]}s; sandbox torn down")
+        notes.append(f"solve exceeded {TRAIN_TIMEOUT_S[mode]}s; sandbox torn down")
         return done()
     if exit_code != 0:
         metrics["failure_class"] = "nonzero_exit"
@@ -479,103 +383,62 @@ def evaluate(workspace: Path, mode: str, split: str, run_id: str, nonce: str,
 
     artifact, failure = _load_artifact(train.artifacts_dir, notes)
     if failure or artifact is None:
-        metrics["failure_class"] = failure or "malformed_artifact"
+        metrics["failure_class"] = failure or "malformed_solution"
         return done()
-    metrics["hyperparams"] = artifact.get("hyperparams")
+    metrics["solver"] = artifact.get("solver")
 
-    ds = _load_dataset_module()
-
-    model, failure = _validate_model(artifact, ds.N_FEATURES, notes)
-    if failure or model is None:
-        metrics["failure_class"] = failure or "malformed_artifact"
-        metrics["degenerate"] = failure == "degenerate_weights"
+    perms, failure = _validate_solutions(instances, artifact.get("solutions"),
+                                         N_CITIES, notes)
+    if failure or perms is None:
+        metrics["failure_class"] = failure or "infeasible_solution"
         return done()
 
-    effective_index = seed_index or 0
-    if split == "test" and effective_index >= MAX_TEST_SEEDS:
-        metrics["failure_class"] = "evaluator_error"
-        notes.append(f"seed_index {effective_index} exceeds MAX_TEST_SEEDS "
-                     f"{MAX_TEST_SEEDS}")
-        return done()
-    xs_h, ys_h = ds.load_split(HELDOUT_CONFIG, split, effective_index)
-    metrics["dataset"] = {
-        "train_seed": ds.TRAIN_SEED,
-        "n_train": ds.N_TRAIN,
-        "split": split,
-        "seed_index": effective_index,
-        "n_heldout": len(ys_h),
-        "heldout_fingerprint": ds.fingerprint(ys_h),
-    }
+    # Trusted objective recomputation — the solver's reported_objectives are
+    # IGNORED entirely. euclid comes from the ROOT dataset module.
+    euclid = ds.euclid_nint
+    per_instance: list[int] = []
+    identity_lengths: list[int] = []
+    nn_lengths: list[int] = []
+    for inst, perm in zip(instances, perms):
+        coords = inst["coords"]
+        per_instance.append(_tour_length(perm, coords, euclid))
+        identity_lengths.append(_tour_length(list(range(N_CITIES)), coords, euclid))
+        nn_lengths.append(_tour_length(_nearest_neighbor(coords, euclid),
+                                       coords, euclid))
 
-    # Phase 5: on the test split, compute per-example squared errors so the
-    # report's paired bootstrap can pair baseline vs incumbent example-by-
-    # example; heldout_rmse is then sqrt(mean(errors)). Other splits keep the
-    # scalar-only path unchanged (no new blindness surface on dev/gate).
-    sq_errors: list[float] | None = None
-    if split == "test":
-        sq_errors = _predict_sq_errors(model, xs_h, ys_h)
-        if sq_errors:
-            total = sum(sq_errors)
-            # Guard the SUM for non-finiteness too (parity with _predict_rmse):
-            # finite per-example errors can still sum to inf on extreme weights.
-            heldout_rmse = (math.sqrt(total / len(sq_errors))
-                            if math.isfinite(total) else None)
-        else:
-            heldout_rmse = None
-    else:
-        heldout_rmse = _predict_rmse(model, xs_h, ys_h, ds.N_FEATURES)
-    if heldout_rmse is None:
-        metrics["failure_class"] = "degenerate_weights"
-        metrics["degenerate"] = True
-        notes.append("non-finite held-out predictions")
-        return done()
+    n = len(per_instance)
+    mean_tour_length = sum(per_instance) / n
+    mean_identity = sum(identity_lengths) / n
+    mean_nn = sum(nn_lengths) / n
 
-    mean_y = sum(ys_h) / len(ys_h)
-    constant_baseline_rmse = math.sqrt(
-        sum((y - mean_y) * (y - mean_y) for y in ys_h) / len(ys_h)
-    )
-
-    xs_t, ys_t = ds.load_train()
-    train_rmse_recomputed = _predict_rmse(model, xs_t, ys_t, ds.N_FEATURES)
-
-    claimed = artifact.get("train_rmse")
-    metrics["metrics"] = {
-        "heldout_rmse": heldout_rmse,
-        "train_rmse_claimed": claimed if _is_finite_number(claimed) else None,
-        "train_rmse_recomputed": train_rmse_recomputed,
-        "generalization_gap": (
-            heldout_rmse - train_rmse_recomputed
-            if train_rmse_recomputed is not None
-            else None
-        ),
-        "constant_baseline_rmse": constant_baseline_rmse,
-        "feature_terms": len(model["spec"]),
-    }
-    if sq_errors is not None:
-        metrics["metrics"]["per_example_sq_errors"] = sq_errors
-
-    if heldout_rmse > constant_baseline_rmse:
-        # Finite but worse than predicting the mean: no measurable skill.
+    # No-skill floor (constant-baseline analog): a solver no better than visiting
+    # cities in index order has no measurable skill.
+    if mean_tour_length >= mean_identity:
         metrics["failure_class"] = "no_skill"
         metrics["degenerate"] = True
         notes.append(
-            f"heldout_rmse {heldout_rmse:.4f} worse than constant baseline "
-            f"{constant_baseline_rmse:.4f}"
-        )
+            f"mean_tour_length {mean_tour_length:.1f} not better than the "
+            f"identity-order tour {mean_identity:.1f}")
         return done()
 
-    metrics["primary_metric"]["value"] = heldout_rmse
+    metrics["metrics"] = {
+        "mean_tour_length": mean_tour_length,
+        "mean_identity_length": mean_identity,
+        "mean_nn_length": mean_nn,
+        # Normalized skill vs the trusted nearest-neighbor reference (display
+        # only; admission uses the scalar primary). <0 means beats NN.
+        "mean_gap_to_nn": ((mean_tour_length - mean_nn) / mean_nn
+                           if mean_nn > 0 else None),
+        "feasible_instances": n,
+        "solve_seconds": artifact.get("solve_seconds"),
+    }
+    # Phase 5: per-instance vector for the report's paired bootstrap (test only —
+    # dev/gate keep the scalar-only surface, no new blindness surface).
+    if split == "test":
+        metrics["metrics"]["per_instance_tour_length"] = per_instance
+
+    metrics["primary_metric"]["value"] = mean_tour_length
     return done()
-
-
-def _atomic_write(out_path: Path, payload: str) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out_path.with_name(out_path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(payload)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, out_path)
 
 
 def main() -> int:
@@ -587,8 +450,6 @@ def main() -> int:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--run-id", default="")
     parser.add_argument("--nonce", default="")
-    # Phase 6a execution sandbox. Passed by the trusted orchestrator from the
-    # contract's `sandbox` block; the evaluator honors only known backends.
     parser.add_argument("--sandbox-backend", default="subprocess")
     parser.add_argument("--sandbox-image", default=None)
     parser.add_argument("--sandbox-memory-mb", type=int, default=512)
@@ -597,10 +458,8 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.mode == "smoke" and args.split != "dev":
-        # gate/test are full-budget admission/report evaluations only.
         parser.error("--mode smoke is only valid with --split dev")
     if args.seed_index is not None and args.split != "test":
-        # Only the test split has multiple seeds (Phase 5 finalist reproduction).
         parser.error("--seed-index is only valid with --split test")
     if args.seed_index is not None and args.seed_index < 0:
         parser.error("--seed-index must be >= 0")

@@ -1,24 +1,33 @@
-"""Synthetic regression dataset for the Phase 1 mock task.
+"""Euclidean-TSP instance generator for the Phase 6c research domain.
 
 PROTECTED FILE (listed in research_contract.yaml protected_globs).
 
-Split hygiene:
-  * The training split uses a public seed (TRAIN_SEED) and is available to
-    candidate code via load_train().
-  * Three hidden held-out splits (dev / gate / test) have independent seeds
-    in evaluation/heldout_config.json, which is generated at
-    `orchestrator.py init` time and deliberately NOT tracked by git —
-    worktrees materialize tracked files only, so candidate workspaces
-    physically lack the seeds. Only the root evaluator calls load_split().
-    dev drives keep/reject search, gate is the blind admission split, test
-    stays untouched until the campaign-end report.
+The task is now combinatorial optimization: the candidate solver in src/train.py
+is handed problem INSTANCES (city coordinates) and must return a tour (a
+permutation); the trusted evaluator recomputes the tour length itself.
+
+Split hygiene (unchanged model, new payload):
+  * The training instances use a public seed (TRAIN_SEED) and are available to
+    the solver via load_train() for offline development.
+  * Three hidden held-out instance sets (dev / gate / test) have independent
+    seeds in evaluation/heldout_config.json, generated at `orchestrator.py init`
+    and NOT tracked by git, so candidate worktrees physically lack the seeds.
+    Only the root evaluator calls load_split(). dev drives keep/reject search,
+    gate is the blind admission split, test stays untouched until the report.
+
+Seed non-leakage (Phase 6c CRITICAL invariant):
+  * The evaluator hands the solver only the INSTANCE COORDINATES, never the seed.
+    Instance ids are OPAQUE indices ("i0", "i1", …) — the seed integer never
+    appears in any structure that crosses into the sandbox, so a solver cannot
+    regenerate other splits or the wider distribution. `fingerprint()` proves
+    which instances scored a run without leaking the seed.
 
 Determinism:
-  * Gaussian samples come from a hand-rolled Box–Muller transform over
-    rng.random(), because random.random() is guaranteed stable across Python
-    versions while distribution helpers such as rng.gauss() are not.
-  * All RNGs are instance-scoped; nothing touches the module-level random
-    state.
+  * Coordinates are integers on a GRID lattice via rng.random() (guaranteed
+    stable across Python versions, unlike randint/shuffle). Euclidean distances
+    use the TSPLIB EUC_2D integer rounding nint(d) = int(d + 0.5), so tour
+    lengths are integer and byte-stable on a machine; fingerprint() catches any
+    cross-machine libm drift.
 """
 
 from __future__ import annotations
@@ -29,60 +38,55 @@ import math
 import random
 from pathlib import Path
 
-N_FEATURES = 8
-
-# Heterogeneous feature scales make feature_scaling a real intervention and
-# couple it with the usable learning-rate range (condition number ~625 when
-# unscaled). The interaction term sits on x0*x1 — both scale 1.0 — so the
-# irreducible floor of a linear model is unaffected by the scales.
-SCALES = [1.0, 1.0, 5.0, 0.2, 1.0, 3.0, 1.0, 0.5]
-TRUE_W = [0.8, -0.5, 0.15, 2.0, -0.7, 0.2, -0.2, 1.2]
-TRUE_BIAS = 0.3
-INTERACTION = 0.3  # coefficient on x0*x1; a linear model cannot capture it
-NOISE_STD = 0.25
+# Number of cities per instance. Cross-checked against evaluation/evaluate.py's
+# hardcoded N_CITIES at `orchestrator.py init` (fails fast on drift).
+N_CITIES = 60
+GRID = 1_000_000  # integer coordinate lattice; keeps distances byte-stable
 
 TRAIN_SEED = 20260401  # public
-N_TRAIN = 600
-# Split sizes are PUBLIC constants hardcoded here (the seeds are the secret):
-# a size read from the untracked config could be manipulated (e.g. a 1-row
-# gate split), so the evaluator trusts only this file for sizes.
-SPLIT_SIZES = {"dev": 400, "gate": 400, "test": 600}
+# Public development instances the solver/coder iterates on offline. Wider than a
+# handful so tuning a solver against them does not trivially overfit before the
+# hidden dev split is ever seen.
+N_TRAIN_INSTANCES = 40
 
-
-def _gauss(rng: random.Random) -> float:
-    """Standard normal via Box–Muller from rng.random() (version-stable)."""
-    u1 = 1.0 - rng.random()  # (0, 1], avoids log(0)
-    u2 = rng.random()
-    return math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
-
-
-def generate(seed: int, size: int) -> tuple[list[list[float]], list[float]]:
-    rng = random.Random(seed)
-    xs: list[list[float]] = []
-    ys: list[float] = []
-    for _ in range(size):
-        x = [_gauss(rng) * SCALES[j] for j in range(N_FEATURES)]
-        y = TRUE_BIAS + sum(w * v for w, v in zip(TRUE_W, x))
-        y += INTERACTION * x[0] * x[1]
-        y += NOISE_STD * _gauss(rng)
-        xs.append(x)
-        ys.append(y)
-    return xs, ys
-
-
-def load_train() -> tuple[list[list[float]], list[float]]:
-    """Public training split. Available to candidate code."""
-    return generate(TRAIN_SEED, N_TRAIN)
-
+# Instances per split (PUBLIC constants; the seeds are the secret). test is sized
+# so the Phase 5 paired bootstrap keeps real resolution: 160 instances x
+# finalist_seeds pairs. A size read from the untracked config could be gamed, so
+# sizes stay hardcoded here.
+SPLIT_SIZES = {"dev": 40, "gate": 40, "test": 160}
 
 HELDOUT_SPLITS = ("dev", "gate", "test")
 
 
-def _split_seeds(entry: dict, split: str) -> list[int]:
-    """Seed list for a split entry (config schema v3).
+def euclid_nint(a: list[int], b: list[int]) -> int:
+    """TSPLIB EUC_2D integer distance nint(sqrt(dx^2 + dy^2))."""
+    dx = a[0] - b[0]
+    dy = a[1] - b[1]
+    return int(math.sqrt(dx * dx + dy * dy) + 0.5)
 
-    dev/gate carry a single ``seed`` (a 1-element list here); ``test`` carries
-    a ``seeds`` list of N pairwise-distinct hidden seeds for Phase 5 multi-seed
+
+def _instance(rng: random.Random, index: int) -> dict:
+    # OPAQUE id — a bare index, NEVER the seed (Phase 6c seed-non-leakage).
+    coords = [[int(rng.random() * GRID), int(rng.random() * GRID)]
+              for _ in range(N_CITIES)]
+    return {"instance_id": f"i{index}", "coords": coords}
+
+
+def generate(seed: int, size: int) -> list[dict]:
+    rng = random.Random(seed)
+    return [_instance(rng, k) for k in range(size)]
+
+
+def load_train() -> list[dict]:
+    """Public training instances. Available to candidate solver code."""
+    return generate(TRAIN_SEED, N_TRAIN_INSTANCES)
+
+
+def _split_seeds(entry: dict, split: str) -> list[int]:
+    """Seed list for a split entry (config schema v4).
+
+    dev/gate carry a single ``seed`` (a 1-element list here); ``test`` carries a
+    ``seeds`` list of N pairwise-distinct hidden seeds for Phase 5 multi-seed
     finalist reproduction. Exactly one of the two keys must be present.
     """
     has_seed = "seed" in entry
@@ -103,10 +107,10 @@ def _split_seeds(entry: dict, split: str) -> list[int]:
 
 def load_split(
     config_path: str | Path, split: str, seed_index: int = 0
-) -> tuple[list[list[float]], list[float]]:
-    """One hidden held-out split (dev/gate/test). Root evaluator only.
+) -> list[dict]:
+    """One hidden held-out instance set (dev/gate/test). Root evaluator only.
 
-    Config schema v3: {"schema_version": 3, "splits": {
+    Config schema v4: {"schema_version": 4, "splits": {
         "dev": {"seed": int}, "gate": {"seed": int},
         "test": {"seeds": [int, ...]}}}.
 
@@ -116,9 +120,9 @@ def load_split(
     if split not in SPLIT_SIZES:
         raise KeyError(f"unknown split {split!r} (have: {sorted(SPLIT_SIZES)})")
     cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
-    if cfg.get("schema_version") != 3:
+    if cfg.get("schema_version") != 4:
         raise KeyError(
-            f"heldout config schema_version must be 3, got "
+            f"heldout config schema_version must be 4, got "
             f"{cfg.get('schema_version')!r} (stale config? re-run "
             f"`orchestrator.py init --force`)")
     splits = cfg.get("splits")
@@ -133,11 +137,21 @@ def load_split(
     return generate(seeds[seed_index], SPLIT_SIZES[split])
 
 
-def fingerprint(values: list[float], k: int = 32) -> str:
-    """Hash of the first k targets.
+def flat_coords(instances: list[dict]) -> list[int]:
+    """Flattened integer coordinate stream (for fingerprinting)."""
+    out: list[int] = []
+    for inst in instances:
+        for xy in inst["coords"]:
+            out.append(xy[0])
+            out.append(xy[1])
+    return out
 
-    Proves which data scored a run (and detects cross-machine libm drift)
-    without leaking the seed itself.
+
+def fingerprint(values: list[int], k: int = 64) -> str:
+    """Hash of the first k coordinate values.
+
+    Proves which instances scored a run (and detects cross-machine libm drift in
+    downstream distance math) without leaking the seed itself.
     """
     payload = ",".join(repr(v) for v in values[:k]).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()

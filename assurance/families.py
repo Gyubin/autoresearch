@@ -16,24 +16,24 @@ change) yields "none", preserving the Phase 4 fallback exactly.
 
 from __future__ import annotations
 
-import re
-
 FAMILIES = (
-    "feature_spec_interaction",  # FEATURE_SPEC gains a multi-index product term
-    "feature_spec_unary",        # FEATURE_SPEC gains a single-index/transform term
-    "hyperparam_code",           # a HYPERPARAMS value edited via code
-    "training_loop",             # train() logic changed (gradient/loss/schedule)
-    "none",                      # patcher, or ambiguous/non-atomic coder change
+    "neighborhood_operator",   # NEIGHBORHOOD swapped, or a move operator changed
+    "construction_change",     # initial-tour construction changed
+    "acceptance_criterion",    # SA / acceptance / cooling rule changed
+    "perturbation",            # perturbation / kick between restarts changed
+    "search_loop",             # the solve / local-search loop structure changed
+    "none",                    # patcher, or ambiguous/non-atomic coder change
 )
 
-_MULTI_INDEX = re.compile(r"\[\s*\d+\s*(?:,\s*\d+\s*)+\]")  # e.g. [0, 1]
-_UNARY_TERM = re.compile(r"\[\s*\d+\s*\]")                  # e.g. [3]
-_HP_KEY = re.compile(
-    r"""^\s*["'](lr|epochs|momentum|l2|batch_size|feature_scaling)["']\s*:""")
-_LOOP_TOKENS = (
-    "def train", "for epoch", "grad", "loss", "schedule", "learning_rate",
-    " += ", "weight update",
-)
+_NEIGHBORHOOD_TOKENS = ("NEIGHBORHOOD", "two_opt", "or_opt", "three_opt",
+                        "2-opt", "or-opt", "_two_opt_move", "_or_opt_move")
+_CONSTRUCTION_TOKENS = ("nearest_neighbor", "greedy_edge", "greedy",
+                        "construct", "use_nn_construction")
+_ACCEPT_TOKENS = ("metropolis", "acceptance", "_accepts", "temperature",
+                  "cooling", "anneal")
+_PERTURB_TOKENS = ("double_bridge", "perturb", "_perturb", "kick")
+_LOOP_TOKENS = ("def solve", "def local_search", "def solve_instance",
+                "tabu", "while ")
 
 
 def _changed_lines(diff: str) -> list[str]:
@@ -47,28 +47,19 @@ def _changed_lines(diff: str) -> list[str]:
     return out
 
 
-def _added_lines(diff: str) -> list[str]:
-    return [line[1:] for line in diff.splitlines()
-            if line.startswith("+") and not line.startswith("+++")]
-
-
 def _signals(diff: str) -> set[str]:
     changed = _changed_lines(diff)
-    added = _added_lines(diff)
     sig: set[str] = set()
-
-    touches_feature_spec = any("FEATURE_SPEC" in ln for ln in changed)
-    if touches_feature_spec and any(_MULTI_INDEX.search(ln) for ln in added):
-        sig.add("feature_spec_interaction")
-    elif touches_feature_spec and any(_UNARY_TERM.search(ln) for ln in added):
-        sig.add("feature_spec_unary")
-
-    if any(_HP_KEY.search(ln) for ln in changed):
-        sig.add("hyperparam_code")
-
+    if any(tok in ln for ln in changed for tok in _NEIGHBORHOOD_TOKENS):
+        sig.add("neighborhood_operator")
+    if any(tok in ln for ln in changed for tok in _CONSTRUCTION_TOKENS):
+        sig.add("construction_change")
+    if any(tok in ln for ln in changed for tok in _ACCEPT_TOKENS):
+        sig.add("acceptance_criterion")
+    if any(tok in ln for ln in changed for tok in _PERTURB_TOKENS):
+        sig.add("perturbation")
     if any(tok in ln for ln in changed for tok in _LOOP_TOKENS):
-        sig.add("training_loop")
-
+        sig.add("search_loop")
     return sig
 
 

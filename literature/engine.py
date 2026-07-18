@@ -27,7 +27,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-CORPUS_SCHEMA_VERSION = 1
+CORPUS_SCHEMA_VERSION = 2
+# Retrieval backends the contract may select. "lexical" is the offline default;
+# "openalex"/"s2" (Phase 6b) name the SOURCE ADAPTER that built the corpus
+# snapshot at `ground --refresh` time — campaign-time ranking is ALWAYS lexical
+# over the frozen snapshot (a live API ranker would break determinism + the
+# input-closure invariant). The value therefore selects the refresh source and
+# asserts snapshot provenance at build time; it never changes campaign ranking.
+# Mirrors sandbox/runner.py SUPPORTED_BACKENDS (constant on the protected pkg,
+# cross-checked by the orchestrator at init).
+SUPPORTED_RETRIEVERS = ("lexical", "openalex", "s2")
 STANCES = ("supports", "contradicts", "adjacent")
 NOVELTY_CATEGORIES = ("replication", "regime_extension",
                       "contradiction_test", "unexplored")
@@ -48,18 +57,37 @@ METRIC_DECIMAL_RE = re.compile(r"\b0\.\d{2,}\b")
 _TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
 
 # Deterministic query lexicon: topic -> query string (Blueprint steps 1-2,
-# default mode). Topics are the loop's intervention families.
+# default mode). Topics ARE the loop's intervention families (Phase 6c: Euclidean
+# TSP heuristics). Keys must cover _TAG_VOCAB["intervention"] so every corpus
+# intervention resolves to a topic in _pack_stance.
 _TOPIC_QUERIES = {
-    "feature_scaling": "feature scaling standardization condition number",
-    "lr": "learning rate step size stability",
-    "momentum": "momentum acceleration step size scaling",
-    "l2": "l2 weight decay ridge regularization",
-    "batch_size": "batch size gradient noise",
-    "epochs": "epochs training budget diminishing returns",
-    "interaction_features": "interaction product feature terms bilinear",
-    "lr_schedule": "learning rate decay schedule",
+    "construction_heuristic": "nearest neighbor greedy edge christofides construction tour",
+    "neighborhood_operator": "2-opt or-opt 3-opt edge exchange local search neighborhood",
+    "acceptance_criterion": "simulated annealing metropolis acceptance hill climbing",
+    "cooling_schedule": "cooling schedule temperature geometric annealing",
+    "restart_strategy": "multi start random restart iterated local search",
+    "perturbation": "double bridge perturbation kick iterated local search",
+    "tabu": "tabu search aspiration short term memory",
+    "iteration_budget": "iteration budget local search convergence plateau",
+    "initial_temperature": "initial temperature annealing acceptance schedule",
 }
-_GENERIC_QUERY = "held-out rmse generalization linear regression sgd"
+_GENERIC_QUERY = "euclidean tsp tour length local search metaheuristic minimize"
+
+# Maps a patcher hyperparameter name to the corpus intervention FAMILY it
+# belongs to, so a hypothesis on e.g. "max_iterations" grounds against
+# "iteration_budget" claims. In the prior regression domain the param names and
+# families coincided (lr, momentum, ...), so no map was needed; here the natural
+# hyperparameter names and the literature family names differ. Exported so the
+# orchestrator's Phase 4 evidence-steering uses the same mapping.
+PARAM_TO_FAMILY = {
+    "use_nn_construction": "construction_heuristic",
+    "max_iterations": "iteration_budget",
+    "restarts": "restart_strategy",
+    "initial_temperature": "acceptance_criterion",
+    "cooling_rate": "cooling_schedule",
+    "segment_max": "neighborhood_operator",
+    "perturbation_strength": "perturbation",
+}
 
 
 class CorpusError(RuntimeError):
@@ -79,13 +107,15 @@ def _evidence_id(claim_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 _TAG_VOCAB = {
-    "intervention": ("feature_scaling", "lr", "momentum", "l2", "batch_size",
-                     "epochs", "interaction_features", "lr_schedule",
-                     "data_augmentation"),
-    "move": ("enable", "disable", "increase", "decrease", "add_terms",
-             "add_schedule", "none"),
+    "intervention": ("construction_heuristic", "neighborhood_operator",
+                     "acceptance_criterion", "cooling_schedule",
+                     "restart_strategy", "perturbation", "tabu",
+                     "iteration_budget", "initial_temperature"),
+    "move": ("enable", "disable", "increase", "decrease", "add_operator",
+             "none"),
     "effect": ("improves", "degrades", "neutral", "conditional"),
-    "model_class": ("linear", "trees", "any"),
+    "model_class": ("euclidean_tsp", "metric_tsp", "general_combinatorial",
+                    "any"),
 }
 
 
@@ -96,6 +126,11 @@ class Corpus:
     papers: dict[str, dict]
     claims: dict[str, dict]
     cited_by: dict[str, tuple[str, ...]]
+    # Phase 6b: optional provenance block written by `ground --refresh` (source,
+    # query set, fetch time, extractor mode). None for the hand-authored mock
+    # corpus. Surfaced so build_engine can assert the snapshot source matches
+    # the contract's chosen retriever; never affects ranking or grounding.
+    provenance: dict | None = None
 
 
 def load_corpus(path: Path) -> Corpus:
@@ -207,6 +242,10 @@ def load_corpus(path: Path) -> Corpus:
                 f"evidence id {slug!r}")
         slugs[slug] = cid
 
+    provenance = data.get("provenance")
+    if provenance is not None and not isinstance(provenance, dict):
+        raise CorpusError("corpus provenance, if present, must be an object")
+
     cited_by: dict[str, list[str]] = {pid: [] for pid in papers}
     for pid, paper in papers.items():
         for ref in paper["references"]:
@@ -217,6 +256,7 @@ def load_corpus(path: Path) -> Corpus:
         papers=papers,
         claims=claims,
         cited_by={pid: tuple(sorted(v)) for pid, v in cited_by.items()},
+        provenance=provenance,
     )
 
 
@@ -398,7 +438,7 @@ class EvidenceEngine:
                  max_evidence_per_hypothesis: int = 4,
                  max_queries: int = 6, stabilization_window: int = 2,
                  citation_hops: int = 1,
-                 task_model_class: str = "linear") -> None:
+                 task_model_class: str = "euclidean_tsp") -> None:
         self.corpus = corpus
         self.retriever = retriever or LexicalRetriever(corpus)
         self.max_evidence_per_generation = max_evidence_per_generation
@@ -410,13 +450,14 @@ class EvidenceEngine:
 
     # -- step 1-2: decomposition / query generation (deterministic lexicon)
     def default_queries(self, hyperparams: dict) -> list[dict]:
-        topics = [t for t in sorted(_TOPIC_QUERIES)
-                  if t in (hyperparams or {})]
-        for extra in ("interaction_features", "lr_schedule"):
-            if extra not in topics:
-                topics.append(extra)
+        # Emit the generic query plus one per intervention family; max_queries
+        # caps how many actually run. (The prior regression domain filtered by
+        # hyperparameter name, but TSP hyperparameter names and intervention
+        # families do not align 1:1, so we cover all families deterministically.)
+        _ = hyperparams  # kept for interface parity; families are domain-fixed
         queries = [{"topic": "generic", "query": _GENERIC_QUERY}]
-        queries += [{"topic": t, "query": _TOPIC_QUERIES[t]} for t in topics]
+        queries += [{"topic": t, "query": _TOPIC_QUERIES[t]}
+                    for t in sorted(_TOPIC_QUERIES)]
         return queries
 
     # -- steps 3-8 + 10, driven by an explicit query list
@@ -526,10 +567,7 @@ class EvidenceEngine:
         tags = claim["tags"]
         if tags["model_class"] not in ("any", self.task_model_class):
             return "adjacent"
-        if tags["intervention"] not in _TOPIC_QUERIES and \
-                tags["intervention"] != "data_augmentation":
-            return "adjacent"
-        if tags["intervention"] == "data_augmentation":
+        if tags["intervention"] not in _TOPIC_QUERIES:
             return "adjacent"
         effect = tags["effect"]
         if effect == "improves":
@@ -626,7 +664,8 @@ class EvidenceEngine:
         param = intervention.get("param")
         if param:
             move = move_of(intervention.get("from"), intervention.get("to"))
-            return str(param), move, toks, norm
+            family = PARAM_TO_FAMILY.get(str(param), str(param))
+            return family, move, toks, norm
         return None, None, toks, norm
 
     def _coder_family(self, tokens: set[str],
@@ -1017,6 +1056,20 @@ def build_engine(cfg: Any, mode: str, model: str | None = None,
                 "relative corpus_path requires an explicit corpus_root")
         corpus_path = corpus_root / corpus_path
     corpus = load_corpus(corpus_path)
+    # Phase 6b: when the contract selects a real source, the frozen snapshot's
+    # provenance must have been built by (or include) that source. Campaign
+    # ranking stays lexical either way; this only prevents silently grounding a
+    # `retriever: s2` campaign on an OpenAlex-only (or mock, provenance-less)
+    # snapshot. Read from cfg.retriever — NEVER overload the `mode` argument.
+    retriever = getattr(cfg, "retriever", "lexical")
+    if retriever in ("openalex", "s2"):
+        prov = corpus.provenance or {}
+        sources = {s for s in str(prov.get("source", "")).split("+") if s}
+        if retriever not in sources:
+            raise CorpusError(
+                f"contract retriever {retriever!r} but corpus provenance "
+                f"source is {prov.get('source')!r}; run `ground --refresh "
+                f"--source {retriever}` to build a matching snapshot")
     engine = EvidenceEngine(
         corpus,
         max_evidence_per_generation=getattr(

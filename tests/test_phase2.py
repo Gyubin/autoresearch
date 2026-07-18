@@ -158,9 +158,16 @@ def test_distill_blindness() -> None:
 # 4. Feature-spec evaluator scoring (the coder's target surface)
 # ---------------------------------------------------------------------------
 
-def test_feature_spec_scoring() -> None:
+def test_solution_validation() -> None:
+    """Phase 6c: the evaluator validates candidate solutions as pure data (a
+    permutation per instance). Full feasibility coverage lives in
+    tests/test_phase6c.py; this is the Phase-2-level smoke that the evaluator
+    imports cleanly and its data-validation seam is wired."""
     ev = orch._load_evaluator_declarations()  # smoke: module imports cleanly
     check("evaluator declares dev/gate/test", ev["split_names"] == ("dev", "gate", "test"))
+    check("evaluator declares mean_tour_length/minimize",
+          ev["metric_name"] == "mean_tour_length"
+          and ev["metric_direction"] == "minimize")
 
     import importlib.util
     spec = importlib.util.spec_from_file_location(
@@ -168,31 +175,16 @@ def test_feature_spec_scoring() -> None:
     ev_mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ev_mod)
 
+    insts = [{"instance_id": "i0", "coords": [[0, 0], [1, 1], [2, 2], [3, 3]]}]
     notes: list[str] = []
-    # identity spec, 8 weights -> valid
-    model, fail = ev_mod._validate_model(
-        {"weights": [0.0] * 8, "bias": 0.0, "hyperparams": {"feature_scaling": False}},
-        8, notes)
-    check("feature_spec: identity spec validates", fail is None and len(model["spec"]) == 8)
-    # explicit spec with interaction term, matching weight count
-    model2, fail2 = ev_mod._validate_model(
-        {"weights": [0.0] * 9, "bias": 0.0,
-         "feature_spec": [[j] for j in range(8)] + [[0, 1]],
-         "hyperparams": {"feature_scaling": False}}, 8, notes)
-    check("feature_spec: interaction term validates",
-          fail2 is None and model2["spec"][-1] == [0, 1])
-    # out-of-range index rejected
-    _, fail3 = ev_mod._validate_model(
-        {"weights": [0.0] * 9, "bias": 0.0,
-         "feature_spec": [[j] for j in range(8)] + [[0, 99]],
-         "hyperparams": {"feature_scaling": False}}, 8, notes)
-    check("feature_spec: out-of-range index rejected", fail3 == "malformed_artifact")
-    # weight/term count mismatch rejected
-    _, fail4 = ev_mod._validate_model(
-        {"weights": [0.0] * 8, "bias": 0.0,
-         "feature_spec": [[j] for j in range(8)] + [[0, 1]],
-         "hyperparams": {"feature_scaling": False}}, 8, notes)
-    check("feature_spec: weight/term mismatch rejected", fail4 == "malformed_artifact")
+    perms, fail = ev_mod._validate_solutions(insts, {"i0": [0, 1, 2, 3]}, 4, notes)
+    check("solution: valid permutation accepted", fail is None and perms == [[0, 1, 2, 3]])
+    _, fail2 = ev_mod._validate_solutions(insts, {"i0": [0, 0, 1, 2]}, 4, notes)
+    check("solution: non-permutation rejected (infeasible)",
+          fail2 == "infeasible_solution")
+    _, fail3 = ev_mod._validate_solutions(insts, "not-a-dict", 4, notes)
+    check("solution: non-dict solutions rejected (malformed)",
+          fail3 == "malformed_solution")
 
 
 def main() -> int:
@@ -202,7 +194,7 @@ def main() -> int:
         test_coder_guard(Path(td))
     test_stagnation_grouping()
     test_distill_blindness()
-    test_feature_spec_scoring()
+    test_solution_validation()
 
     print()
     if FAILS:

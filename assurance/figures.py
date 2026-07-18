@@ -54,7 +54,7 @@ def _experiments(records: list[dict]) -> list[dict]:
 def _dev_trajectory(records: list[dict]) -> str:
     svg = Svg(_W, _H)
     x0, x1, y0, y1 = _axes(svg, "Dev incumbent trajectory",
-                           "generation", "heldout_rmse (dev)")
+                           "generation", "mean_tour_length (dev)")
     base = _baseline_primary(records)
     exps = _experiments(records)
     gens = sorted({g for r in exps
@@ -92,8 +92,8 @@ def _dev_trajectory(records: list[dict]) -> str:
 
 def _test_paired(boot) -> str:
     svg = Svg(_W, _H)
-    x0, x1, y0, y1 = _axes(svg, "Per-seed test RMSE (baseline -> incumbent)",
-                           "test seed", "heldout_rmse (test)")
+    x0, x1, y0, y1 = _axes(svg, "Per-seed test tour length (baseline -> incumbent)",
+                           "test seed", "mean_tour_length (test)")
     seeds = list(boot.per_seed)
     vals = [v for s in seeds for v in (s.rmse_baseline, s.rmse_incumbent)
             if isinstance(v, (int, float))]

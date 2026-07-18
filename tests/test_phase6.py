@@ -100,8 +100,8 @@ def test_subprocess_regression(tmp: Path) -> None:
           and res.backend == "subprocess")
     check("subprocess: artifacts under workspace",
           res.artifacts_dir == ROOT / "artifacts")
-    check("subprocess: model.json produced",
-          (res.artifacts_dir / "model.json").is_file())
+    check("subprocess: solution.json produced",
+          (res.artifacts_dir / "solution.json").is_file())
     check("subprocess: logs in log_dir", res.stdout_path.parent == tmp)
 
 
@@ -268,7 +268,7 @@ def test_contract_sandbox_validation(tmp: Path) -> None:
     contract = orch.load_contract()
     sb = contract.sandbox
     check("contract: shipped sandbox default",
-          contract.schema_version == 6 and sb.backend == "subprocess"
+          contract.schema_version == 8 and sb.backend == "subprocess"
           and sb.image is None and sb.memory_mb == 512 and sb.cpus == 1.0
           and sb.pids_limit == 128)
     check("contract: sandbox/** on the protected path",

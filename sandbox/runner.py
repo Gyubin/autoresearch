@@ -45,6 +45,12 @@ SUPPORTED_BACKENDS = ("subprocess", "container")
 # writable surfaces are the artifacts bind mount, a /tmp tmpfs, and the masked
 # experiments tmpfs.
 _WORKDIR = "/w"
+# Phase 6c: the trusted evaluator hands the candidate solver the split's problem
+# instances (COORDINATES ONLY — never the seed) through a read-only mount at this
+# fixed in-container path, advertised via AUTORESEARCH_INSTANCES. The seed masks
+# below are unchanged: the solver sees the instance it must solve, never the seed
+# that generated it or any other split.
+_INSTANCES_MOUNT = "/w/instances.json"
 # nobody:nogroup on typical Linux images — a non-root uid with no host mapping.
 _UID_GID = "65534:65534"
 _INFRA_EXIT_CODES = frozenset({125, 126, 127})  # docker/OCI launch failures
@@ -86,13 +92,17 @@ class Sandbox(Protocol):
     backend: str
 
     def run_train(self, workspace: Path, mode: str, env: dict[str, str],
-                  timeout_s: int, log_dir: Path, name_hint: str) -> TrainResult:
+                  timeout_s: int, log_dir: Path, name_hint: str,
+                  instances_path: Path | None = None) -> TrainResult:
         """Run <workspace>/src/train.py, returning a TrainResult.
 
         `env` is the from-scratch environment the trusted evaluator built;
         `log_dir` receives the stdout/stderr logs (and, for the container
-        backend, the fresh writable artifacts dir). Deterministic and side
-        effect free apart from those scratch writes."""
+        backend, the fresh writable artifacts dir). `instances_path`, when given
+        (Phase 6c), is a host file of problem instances made available to the
+        solver read-only (mounted for the container backend, an env-var path for
+        subprocess) via AUTORESEARCH_INSTANCES — coordinates only, no seed.
+        Deterministic and side effect free apart from those scratch writes."""
         ...
 
 
@@ -105,10 +115,17 @@ class SubprocessSandbox:
     backend = "subprocess"
 
     def run_train(self, workspace: Path, mode: str, env: dict[str, str],
-                  timeout_s: int, log_dir: Path, name_hint: str) -> TrainResult:
+                  timeout_s: int, log_dir: Path, name_hint: str,
+                  instances_path: Path | None = None) -> TrainResult:
         stdout_path = log_dir / f"train_stdout_{mode}.log"
         stderr_path = log_dir / f"train_stderr_{mode}.log"
         cmd = [sys.executable, "-s", "-B", str(workspace / "src" / "train.py")]
+        if instances_path is not None:
+            # Copy so we never mutate the evaluator's env dict. No OS isolation
+            # here, so the solver could read other files anyway; the trusted
+            # evaluator recomputes the objective, and gate/test admission is
+            # only trustworthy under the container backend (documented).
+            env = {**env, "AUTORESEARCH_INSTANCES": str(instances_path.resolve())}
         with open(stdout_path, "wb") as f_out, open(stderr_path, "wb") as f_err:
             proc = subprocess.Popen(
                 cmd, cwd=workspace, env=env,
@@ -168,7 +185,8 @@ class ContainerSandbox:
 
     def docker_argv(self, workspace: Path, env: dict[str, str],
                     host_artifacts: Path, mask_file: Path,
-                    container_name: str) -> list[str]:
+                    container_name: str,
+                    instances_path: Path | None = None) -> list[str]:
         c = self._cfg
         wd = self._workdir
         # Docker `-v` sources must be ABSOLUTE host paths — a relative path is
@@ -200,15 +218,23 @@ class ContainerSandbox:
             "--tmpfs", f"{wd}/experiments:rw,size=1m,noexec,nosuid,nodev",
             "--workdir", wd,
         ]
+        # Phase 6c: the split's instances, read-only, at a fixed path. Coordinates
+        # only — the seed that generated them stays in the trusted evaluator and
+        # is still masked above, so the solver cannot regenerate other splits.
+        if instances_path is not None:
+            argv += ["-v", f"{instances_path.resolve()}:{_INSTANCES_MOUNT}:ro"]
         # Only forward the deterministic knobs; the image supplies PATH etc.
         for key in ("PYTHONHASHSEED", "AUTORESEARCH_SMOKE"):
             if key in env:
                 argv += ["-e", f"{key}={env[key]}"]
+        if instances_path is not None:
+            argv += ["-e", f"AUTORESEARCH_INSTANCES={_INSTANCES_MOUNT}"]
         argv += [c.image, "python", "-s", "-B", "src/train.py"]
         return argv
 
     def run_train(self, workspace: Path, mode: str, env: dict[str, str],
-                  timeout_s: int, log_dir: Path, name_hint: str) -> TrainResult:
+                  timeout_s: int, log_dir: Path, name_hint: str,
+                  instances_path: Path | None = None) -> TrainResult:
         stdout_path = log_dir / f"train_stdout_{mode}.log"
         stderr_path = log_dir / f"train_stderr_{mode}.log"
         host_artifacts = log_dir / f"artifacts_{mode}"
@@ -219,7 +245,7 @@ class ContainerSandbox:
         mask_file.write_bytes(b"")  # empty: masks the seeds if read
         container_name = _sanitize_name(f"{name_hint}-{mode}")
         argv = self.docker_argv(workspace, env, host_artifacts, mask_file,
-                                container_name)
+                                container_name, instances_path=instances_path)
 
         exit_code: int | None = None
         timed_out = False

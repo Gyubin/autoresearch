@@ -1,9 +1,10 @@
 """Paired-example bootstrap confidence intervals (Phase 5, Blueprint Layer 8).
 
 Pure stdlib (no numpy/scipy). The finalist is reproduced on N hidden test
-seeds; on each seed the baseline and incumbent are scored on the SAME dataset,
-so their per-example squared errors are paired. We pool the N x 600 paired
-examples and bootstrap over the pooled pairs (joint resampling of indices),
+seeds; on each seed the baseline and incumbent are scored on the SAME instances,
+so their per-instance objectives (Phase 6c: tour lengths) are paired. We pool
+the N x instances paired values and bootstrap over the pooled pairs (joint
+resampling of indices),
 which captures test-sampling variability — the only randomness here, since
 training is deterministic. Seeds are i.i.d. draws from one generator, not
 statistical clusters, so a hierarchical (resample-seeds-then-examples)
@@ -23,7 +24,12 @@ import random
 import statistics
 from dataclasses import dataclass
 
-_RMSE_TOLERANCE = 1e-9  # per-seed recompute vs the evaluator's heldout_rmse
+# Per-seed recompute vs the evaluator's scalar primary. The pooled statistic is
+# the arithmetic MEAN of the per-instance objective (Phase 6c: tour length);
+# with exact integer tour lengths this is exact, so the tolerance only guards a
+# hand-edited scalar. (The *_pooled / rmse_* field names below are retained for
+# wire/report compatibility but now carry the pooled mean objective, not RMSE.)
+_SELF_CONSISTENCY_TOL = 1e-6
 
 
 class StatsError(Exception):
@@ -69,15 +75,17 @@ def derive_bootstrap_seed(campaign_id: str, baseline_commit: str,
                           "big")
 
 
-def _rmse(errors: list[float]) -> float:
-    return math.sqrt(sum(errors) / len(errors))
+def _pooled(values: list[float]) -> float:
+    """Pooled statistic = arithmetic mean of the per-instance objective (Phase 6c
+    tour length). Was sqrt(mean(sq_errors)) for the RMSE domain."""
+    return sum(values) / len(values)
 
 
 def _clean_errors(metrics: dict) -> list[float] | None:
-    """Per-example squared errors iff the run scored cleanly, else None."""
+    """Per-instance tour lengths iff the run scored cleanly, else None."""
     if (metrics.get("primary_metric") or {}).get("value") is None:
         return None
-    errs = (metrics.get("metrics") or {}).get("per_example_sq_errors")
+    errs = (metrics.get("metrics") or {}).get("per_instance_tour_length")
     if not isinstance(errs, list) or not errs:
         return None
     if not all(isinstance(e, (int, float)) and math.isfinite(e) for e in errs):
@@ -110,8 +118,8 @@ def extract_paired_errors(
         ei = _clean_errors(mi)
         fb = mb.get("failure_class")
         fi = mi.get("failure_class")
-        fp_b = (mb.get("dataset") or {}).get("heldout_fingerprint")
-        fp_i = (mi.get("dataset") or {}).get("heldout_fingerprint")
+        fp_b = (mb.get("dataset") or {}).get("instances_fingerprint")
+        fp_i = (mi.get("dataset") or {}).get("instances_fingerprint")
         if eb is None or ei is None:
             seed_stats.append(SeedStats(
                 seed_index=i, rmse_baseline=None, rmse_incumbent=None,
@@ -122,20 +130,20 @@ def extract_paired_errors(
             raise StatsError(
                 f"seed_index {i}: baseline/incumbent fingerprints differ "
                 f"({fp_b} vs {fp_i}) — pairing invalid (data drift)")
-        rb, ri = _rmse(eb), _rmse(ei)
-        # Self-consistency / tamper check: the scalar heldout_rmse and the
-        # per_example_sq_errors come from the SAME evaluator run, so this only
+        rb, ri = _pooled(eb), _pooled(ei)
+        # Self-consistency / tamper check: the scalar mean_tour_length and the
+        # per_instance_tour_length come from the SAME evaluator run, so this only
         # catches a metrics file whose scalar was hand-edited to disagree with
-        # its own error array. The real integrity guarantees are the nonce,
-        # evaluator self-hash, and protection manifest (in run_evaluator); the
-        # heldout_fingerprint equality above is what catches data drift.
+        # its own per-instance array. The real integrity guarantees are the
+        # nonce, evaluator self-hash, and protection manifest (in run_evaluator);
+        # the instances_fingerprint equality above is what catches data drift.
         for name, errs, m in (("baseline", eb, mb), ("incumbent", ei, mi)):
-            reported = (m.get("metrics") or {}).get("heldout_rmse")
-            recomputed = _rmse(errs)
-            if reported is not None and abs(reported - recomputed) > _RMSE_TOLERANCE:
+            reported = (m.get("metrics") or {}).get("mean_tour_length")
+            recomputed = _pooled(errs)
+            if reported is not None and abs(reported - recomputed) > _SELF_CONSISTENCY_TOL:
                 raise StatsError(
-                    f"seed_index {i} {name}: per-example RMSE {recomputed} "
-                    f"disagrees with evaluator heldout_rmse {reported}")
+                    f"seed_index {i} {name}: per-instance mean {recomputed} "
+                    f"disagrees with evaluator mean_tour_length {reported}")
         errs_b.append(eb)
         errs_inc.append(ei)
         seed_stats.append(SeedStats(
@@ -157,7 +165,7 @@ def paired_bootstrap(
     seed_stats: list[SeedStats], *, resamples: int, seed: int,
     confidence: float = 0.95,
 ) -> BootstrapResult:
-    """Pooled paired-example bootstrap of the RMSE difference.
+    """Pooled paired-instance bootstrap of the mean-objective difference.
 
     Clean only when every seed pair is clean (len(errs_b) == len(seed_stats));
     otherwise no bootstrap runs (effect/CI None) — the evaluator stays the sole
@@ -176,8 +184,8 @@ def paired_bootstrap(
     pooled_b = [e for seed_errs in errs_b for e in seed_errs]
     pooled_i = [e for seed_errs in errs_inc for e in seed_errs]
     m = len(pooled_b)
-    rmse_b_pooled = _rmse(pooled_b)
-    rmse_i_pooled = _rmse(pooled_i)
+    rmse_b_pooled = _pooled(pooled_b)   # pooled mean objective (see _pooled note)
+    rmse_i_pooled = _pooled(pooled_i)
     effect_abs = rmse_b_pooled - rmse_i_pooled
     effect_rel = effect_abs / rmse_b_pooled if rmse_b_pooled > 0 else 0.0
 
@@ -192,8 +200,8 @@ def paired_bootstrap(
             j = randrange(m)  # ONE index — resample pairs jointly
             sb += pooled_b[j]
             si += pooled_i[j]
-        rb = math.sqrt(sb / m)
-        ri = math.sqrt(si / m)
+        rb = sb / m   # pooled MEAN objective per resample (was sqrt(mean) RMSE)
+        ri = si / m
         deltas_abs.append(rb - ri)
         deltas_rel.append((rb - ri) / rb if rb > 0 else 0.0)
 

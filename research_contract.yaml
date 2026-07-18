@@ -10,17 +10,19 @@
 # To intentionally change the contract: stop all runs, `chmod u+w` the file,
 # edit, then re-run `orchestrator.py init --force` to rebuild the manifest.
 # =============================================================================
-schema_version: 6
-contract_id: autoresearch-phase6-sandbox
+schema_version: 8
+contract_id: autoresearch-phase6c-tsp
 
 objective: >
-  Minimize held-out RMSE of the model trained by src/train.py. Interventions
-  may change training hyperparameters (deterministic patcher) or edit code
-  under src/** (LLM coding worker). The evaluator, dataset definition, this
-  contract, and the orchestrator are immutable during runs.
+  Minimize the mean held-out Euclidean-TSP tour length produced by the solver in
+  src/train.py across hidden instances. The evaluator generates instances from
+  hidden seeds, hands the solver only the coordinates, and RECOMPUTES the tour
+  length itself. Interventions may change search hyperparameters (deterministic
+  patcher) or edit code under src/** (LLM coding worker). The evaluator, dataset
+  definition, this contract, and the orchestrator are immutable during runs.
 
 primary_metric:
-  name: heldout_rmse
+  name: mean_tour_length
   direction: minimize
   # Relative epsilon keep-rule: accept a candidate only if it improves the
   # incumbent by at least this fraction. Evaluation is deterministic, so a
@@ -28,9 +30,9 @@ primary_metric:
   min_relative_improvement: 0.002
 
 secondary_metrics:
-  - train_rmse
-  - generalization_gap
-  - train_seconds
+  - mean_gap_to_nn
+  - feasible_instances
+  - solve_seconds
 
 editable_globs:
   - "src/**"
@@ -64,8 +66,8 @@ budgets:
   # Must match the hardcoded values in evaluation/evaluate.py; the evaluator
   # never parses this file (it trusts nothing outside evaluation/), and
   # `orchestrator.py init` cross-checks the two once, failing fast on drift.
-  smoke_train_timeout_s: 20
-  dev_train_timeout_s: 90
+  smoke_train_timeout_s: 30
+  dev_train_timeout_s: 120
   # max_rounds is the EXPERIMENT budget (rNNNN allocator), not generations:
   # a generation of parallel_branches consumes that many rounds.
   max_rounds: 60
@@ -109,7 +111,12 @@ literature:
   # OpenAlex/S2 adapter later. Literature NEVER touches scoring: the
   # evaluator does not read this block and no evidence flows gate-ward.
   enabled: true
-  corpus_path: "literature/corpus/mock_corpus.json"
+  corpus_path: "literature/corpus/tsp_corpus.json"
+  # retriever: lexical | openalex | s2. "lexical" is the offline default over
+  # the frozen corpus. "openalex"/"s2" (Phase 6b) name the SOURCE that built
+  # the snapshot at `ground --refresh` time — campaign-time ranking stays
+  # lexical either way (a live API ranker would break determinism). Selecting
+  # openalex/s2 requires a snapshot whose provenance.source matches.
   retriever: lexical
   max_evidence_per_generation: 12
   max_evidence_per_hypothesis: 4
@@ -122,6 +129,21 @@ literature:
   # degrades to lexical grounding, mode "claude+budget_exhausted").
   llm_max_budget_usd: 0.5
   llm_max_campaign_budget_usd: null
+  # Phase 6b: `ground --refresh` MAINTENANCE settings (fetch real papers →
+  # LLM-extract claim-level evidence → frozen corpus snapshot under
+  # literature/). NEVER read on the campaign path. The S2 API key is ENV-only
+  # (S2_API_KEY) and deliberately absent here so no secret lands in this
+  # committed, protected file.
+  refresh:
+    sources: [openalex]          # subset of {openalex, s2}; OpenAlex is keyless
+    mailto: null                 # OpenAlex polite-pool email (string) or null
+    per_source_max: 40           # max papers fetched per source
+    max_papers: 60               # max papers kept in the snapshot after dedup
+    max_retries: 3               # bounded backoff on HTTP 429/5xx per page
+    extractor: claude            # claude (LLM-assisted) | deterministic
+    extractor_model: null        # model pin for the extractor; null = default
+    extractor_max_budget_usd: 0.5            # per-paper SDK budget cap
+    extractor_max_campaign_budget_usd: 20.0  # total refresh budget cap (null = off)
 
 refinement:
   # Phase 4a directed branch refinement (Gome-style search momentum +
