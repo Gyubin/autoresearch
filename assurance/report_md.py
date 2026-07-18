@@ -100,6 +100,19 @@ def render_report(claims: list[dict], meta: dict) -> str:
     d.lit(" · incumbent ").val(meta["incumbent_commit_short"])
     d.lit(" · ").val(meta["report_date"]).lit("\n\n")
 
+    # execution-isolation trust grade (Phase 6c): a subprocess-run report is
+    # honest-looking, but the solver could read the held-out seed, so it is NOT
+    # trust-grade. Surfaced in the header so a reader sees it without digging
+    # into the metrics. Omitted when the caller passes no backend (unit fixtures).
+    backend = meta.get("sandbox_backend")
+    if backend:
+        d.lit("Execution isolation: ").val(backend).lit(" — ")
+        d.lit("trust-grade (held-out seed masked from the solver)."
+              if meta.get("trusted") else
+              "NOT trust-grade: no filesystem isolation, so the solver could "
+              "read the held-out seed. Re-run under sandbox.backend: container "
+              "to trust these numbers.").lit("\n\n")
+
     # --- headline ---
     d.lit("## Headline result\n\n")
     d.val(primary["text"]).lit("\n\n")

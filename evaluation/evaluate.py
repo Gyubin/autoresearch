@@ -29,7 +29,8 @@ Trust model / invariants:
         admission is only fully trustworthy under the CONTAINER backend (the
         subprocess backend has no FS isolation and can read the seed file by
         absolute path). subprocess stays the Docker-free default for dev/smoke
-        and tests; the orchestrator warns when it is used for gate/report.
+        and tests; the orchestrator warns when it is used for gate/report, and
+        sandbox.require_container_for_trusted_splits turns that into a hard error.
 
   * Phase 6a execution sandbox unchanged: the solver runs under sandbox/runner.py
     (loaded from THIS repo by absolute path); the container backend runs it with

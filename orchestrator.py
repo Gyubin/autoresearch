@@ -65,8 +65,8 @@ import yaml
 # stdlib at import time (its LLM path lazy-imports the SDK), no orchestrator
 # import on its side, and it never reads experiments/ or state.
 from literature.engine import (ANTI_INJECTION_SENTENCE, CorpusError,
-                               SUPPORTED_RETRIEVERS, build_engine, load_corpus,
-                               move_of)
+                               PARAM_TO_FAMILY, SUPPORTED_RETRIEVERS,
+                               build_engine, load_corpus, move_of)
 
 # The assurance package (Phase 5) is likewise a separate, protected module:
 # stdlib-only, never imports the orchestrator, and performs no file IO (all
@@ -819,9 +819,19 @@ def load_contract(path: Path = CONTRACT_PATH) -> ResearchContract:
         raise ContractError("sandbox.cpus must be positive")
     if sb_pids < 1:
         raise ContractError("sandbox.pids_limit must be >= 1")
+    # Optional trust policy: hard-require the container backend for the
+    # seed-holding splits (gate/test). Default False = warn-only (see
+    # _trusted_backend_policy). Backward compatible: absent key keeps old
+    # behaviour, so no schema_version bump is needed.
+    sb_require_container = sb_raw.get(
+        "require_container_for_trusted_splits", False)
+    if not isinstance(sb_require_container, bool):
+        raise ContractError(
+            "sandbox.require_container_for_trusted_splits must be a boolean")
     sandbox = SandboxConfig(
         backend=sb_backend, image=sb_image, memory_mb=sb_memory_mb,
         cpus=sb_cpus, pids_limit=sb_pids,
+        require_container_for_trusted_splits=sb_require_container,
     )
 
     return ResearchContract(
@@ -1422,8 +1432,12 @@ class HeuristicProposer:
             index, (_kind, param, new_value) = item
             move = move_of(hp.get(param), new_value)
             score = (ctx.momentum.get(f"{param}:{move}") or {}).get("score", 0.0)
+            # guidance is keyed by intervention FAMILY (corpus tag vocab), not
+            # the raw hyperparameter name; translate exactly as the grounding
+            # path does (engine._hypothesis_family) or every patcher move misses.
+            fam = PARAM_TO_FAMILY.get(param, param)
             ev_rank = {"supports": 0, "contradicts": 2}.get(
-                guidance.get((param, move)), 1)
+                guidance.get((fam, move)), 1)
             return (-score, ev_rank, index)
 
         return [cand for _, cand in sorted(enumerate(candidates), key=rank)]
@@ -1490,7 +1504,8 @@ class HeuristicProposer:
                 move = move_of(hp.get(param), new_value)
                 if f"{param}:{move}" in ctx.momentum:
                     continue
-                if guidance.get((param, move)) == "supports":
+                fam = PARAM_TO_FAMILY.get(param, param)
+                if guidance.get((fam, move)) == "supports":
                     continue
                 explore_ok.add(i)
 
@@ -3236,6 +3251,8 @@ def _run_gate(ctx: LoopContext, state: dict, records: list[dict],
     contract = ctx.contract
     pm = contract.primary_metric
     pf = contract.portfolio
+    # gate holds a hidden seed: warn (or fail-closed) if not isolated.
+    _trusted_backend_policy(contract, "gate")
 
     gate_record: dict = {
         "record_type": "gate",
@@ -3843,6 +3860,33 @@ def _sandbox_preflight(contract: ResearchContract) -> None:
         sandbox_preflight(contract.sandbox)
     except SandboxError as exc:
         raise OrchestratorError(str(exc)) from None
+
+
+def _trusted_backend_policy(contract: ResearchContract, split_label: str) -> None:
+    """Trust policy for the seed-holding splits (gate/test).
+
+    The candidate solver runs on held-out instances, so a score is only
+    trust-grade under the `container` backend, which masks the seed file out of
+    the mount. The `subprocess` backend has no filesystem isolation: the solver
+    can read the held-out seed by absolute path, regenerate the hidden instances,
+    and overfit — its gate/test score is then honest-looking but untrustworthy.
+
+    Called once per gate/report phase (never per candidate instance). With
+    sandbox.require_container_for_trusted_splits set, a non-container backend is a
+    hard, fail-closed error; otherwise it runs but warns loudly, so the
+    limitation is never silent (dev/smoke stays Docker-free by default)."""
+    sb = contract.sandbox
+    if sb.backend == "container":
+        return
+    msg = (f"{split_label} split runs under the {sb.backend!r} sandbox backend, "
+           f"which has NO filesystem isolation: a candidate solver can read the "
+           f"held-out seed file by absolute path and overfit the hidden "
+           f"instances, so its {split_label} score is not trust-grade. Set "
+           f"sandbox.backend: container for a trustworthy {split_label} result.")
+    if sb.require_container_for_trusted_splits:
+        raise OrchestratorError(
+            msg + " (sandbox.require_container_for_trusted_splits is set).")
+    print(f"[warn] {msg}", file=sys.stderr)
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -4479,6 +4523,9 @@ def cmd_report(args: argparse.Namespace) -> int:
     # Phase 6a: fail closed before spending the single-use test split if the
     # isolation backend is not ready (no-op for the subprocess backend).
     _sandbox_preflight(contract)
+    # test holds the hidden final-report seeds: warn (or fail-closed) if the
+    # backend is not isolating, so the report's trust grade is never silent.
+    _trusted_backend_policy(contract, "test")
     figures_dir = report_dir / "figures"
     n_seeds = contract.assurance.finalist_seeds
     baseline_commit = baseline_rec["commit"]
@@ -4636,6 +4683,10 @@ def cmd_report(args: argparse.Namespace) -> int:
         "fig_paired": "test_paired_rmse.svg",
         "fig_trajectory": "dev_trajectory.svg",
         "fig_verdicts": "verdict_mix.svg",
+        # trust grade of the test-split numbers (Phase 6c): only the container
+        # backend masks the held-out seed, so a subprocess report is not trusted.
+        "sandbox_backend": contract.sandbox.backend,
+        "trusted": contract.sandbox.backend == "container",
     }
     report_md_text = report_md.render_report(claim_list, report_meta)
     atomic_write_text(report_dir / "report.md", report_md_text)

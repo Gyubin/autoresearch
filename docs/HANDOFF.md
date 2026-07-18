@@ -33,15 +33,19 @@
   가드로 주입 abstract가 support를 못 만들게 함) + Phase 6c(도메인을 Euclidean-TSP
   휴리스틱으로 교체 — 평가기가 hidden seed로 인스턴스 생성→solver에 좌표만 전달→
   tour 길이 재계산. seed는 샌드박스로 안 넘어감(불투명 id), 자가보고 objective 무시).
-- **미완/후속**: (1) 6c에서 patcher 하이퍼파라미터의 evidence_steering은 약함(param↔
-  family는 `engine.PARAM_TO_FAMILY`로 grounding은 연결되나 orchestrator rank()의
-  steering 조회는 미연결) — 후속 정렬 대상. (2) 현재 corpus(`tsp_corpus.json`)는
-  큐레이션된 오프라인 스냅샷(provenance 비어 있음)이며, 실 문헌 반영(Part C)은 네트워크
-  호스트에서 `ground --refresh` + 태그 diff 사람 리뷰 후. (3) subprocess 백엔드는
-  seed 파일 절대경로 접근이 가능해 gate/test 신뢰 채점은 `container` 백엔드에서만 완전.
+- **완료(후속 처리)**: (A) evidence_steering param→family 정렬 — `orchestrator.rank()`/
+  explore 필터가 `engine.PARAM_TO_FAMILY`로 raw param을 family로 변환해 문헌 조향이 실제로
+  동작(`tests/test_phase4.py`의 실 corpus end-to-end 드릴). 남은 공백: corpus의
+  `neighborhood_operator/add_operator` claim은 편집 표면(segment_max=increase/decrease)에
+  대응 무브가 없어 매칭 안 됨(정직한 비목표). (C) container 신뢰 정책 결속 — gate/test가
+  비격리 백엔드면 orchestrator가 상시 경고, `sandbox.require_container_for_trusted_splits: true`
+  면 fail-closed; report.md 헤더에 신뢰 등급 스탬프. `evaluate.py`의 "경고한다" 주석이 참이 됨.
+- **미완(운영)**: 현재 corpus(`tsp_corpus.json`)는 큐레이션된 오프라인 스냅샷(provenance
+  비어 있음). 실 문헌 반영(Part C)은 네트워크 호스트에서 `ground --refresh` → 태그 diff
+  사람 리뷰 → `init --force`(핸들러는 `tests/test_phase6b.py`가 오프라인 검증; 실 네트워크
+  경로만 미커버). README "실 문헌 corpus 새로고침" 런북 참고.
 - **다음(실행 시)**: `uv run python orchestrator.py run --generations N` (또는 전체
-  LLM 경로 `--proposer claude --literature claude --gate pairwise`). 실 문헌으로
-  재그라운딩하려면 위 (2)의 Part C 절차.
+  LLM 경로 `--proposer claude --literature claude --gate pairwise`).
 
 ## 1. 지금 실행해보기
 

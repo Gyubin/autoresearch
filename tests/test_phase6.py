@@ -309,6 +309,69 @@ def test_contract_sandbox_validation(tmp: Path) -> None:
           ok.sandbox.backend == "container"
           and ok.sandbox.image == "python:3.14-slim@sha256:abc")
 
+    # Phase 6c trust policy: optional bool, defaults off, rejects non-bool.
+    check("contract: trusted-split policy defaults off",
+          sb.require_container_for_trusted_splits is False)
+    expect_reject("non-bool trusted-split policy",
+                  text.replace("require_container_for_trusted_splits: false",
+                               "require_container_for_trusted_splits: maybe"))
+
+
+# ---------------------------------------------------------------------------
+# Trust policy: gate/test must be container (opt-in) or at least warn
+# ---------------------------------------------------------------------------
+
+def test_trusted_split_policy(tmp: Path) -> None:
+    """gate/test hold a hidden seed, so _trusted_backend_policy must (a) warn on
+    a non-isolating backend and (b) fail closed when the contract opts in via
+    require_container_for_trusted_splits. The container backend is trust-grade,
+    so it passes silently even under the strict flag."""
+    import contextlib
+    import io
+
+    text = orch.CONTRACT_PATH.read_text()
+
+    def load_mutated(mutated: str):
+        path = tmp / "policy.yaml"
+        path.write_text(mutated)
+        return orch.load_contract(path)
+
+    # Shipped default: subprocess + policy off -> warns loudly, never raises.
+    default_c = orch.load_contract()
+    for split in ("gate", "test"):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            orch._trusted_backend_policy(default_c, split)  # must not raise
+        out = err.getvalue()
+        check(f"policy: subprocess {split} warns, never silent",
+              "[warn]" in out and split in out and "not trust-grade" in out)
+
+    # Opt-in flag + subprocess -> hard, fail-closed error on both splits.
+    strict = load_mutated(text.replace(
+        "require_container_for_trusted_splits: false",
+        "require_container_for_trusted_splits: true"))
+    check("policy: opt-in flag parses true",
+          strict.sandbox.require_container_for_trusted_splits is True)
+    for split in ("gate", "test"):
+        try:
+            orch._trusted_backend_policy(strict, split)
+            check(f"policy: strict {split} fails closed", False, "no raise")
+        except orch.OrchestratorError as exc:
+            check(f"policy: strict {split} fails closed",
+                  "require_container_for_trusted_splits" in str(exc))
+
+    # container backend -> trust-grade: silent (no warn, no raise) even strict.
+    container = load_mutated(
+        text.replace("backend: subprocess", "backend: container")
+            .replace("image: null", 'image: "python:3.14-slim@sha256:abc"')
+            .replace("require_container_for_trusted_splits: false",
+                     "require_container_for_trusted_splits: true"))
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        orch._trusted_backend_policy(container, "gate")
+        orch._trusted_backend_policy(container, "test")
+    check("policy: container is trust-grade and silent", err.getvalue() == "")
+
 
 # ---------------------------------------------------------------------------
 # No drift: evaluator declaration <-> sandbox module <-> orchestrator import
@@ -372,6 +435,7 @@ def main() -> int:
         test_container_timeout_teardown(tmp)
         test_preflight_fail_closed()
         test_contract_sandbox_validation(tmp)
+        test_trusted_split_policy(tmp)
         test_no_backend_drift()
         test_evaluator_provenance(tmp)
 

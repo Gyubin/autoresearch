@@ -401,10 +401,87 @@ def test_no_campaign_time_network_or_import() -> None:
           proc.stderr[-400:])
 
 
+def test_ground_refresh_handler(tmp: Path) -> None:
+    """Offline coverage of the cmd_ground_refresh handler — the orchestrator side
+    of `ground --refresh` that no other drill exercises: the chmod gate, the
+    validate-before-overwrite atomicity (a bad fetch keeps the old snapshot), and
+    the REVIEW-before-freeze print gate. build_corpus_snapshot is stubbed; the
+    live network/LLM path is exercised only by a real run on a network host.
+
+    orch.ROOT is repointed at a throwaway tree so the real corpus is never
+    touched (the handler writes ROOT/<corpus_path>)."""
+    import argparse
+    import contextlib
+    import io
+
+    corpus_rel = "literature/corpus/tsp_corpus.json"
+    root = tmp / "repo"
+    (root / "literature" / "corpus").mkdir(parents=True)
+    snap = root / corpus_rel
+    snap.write_text('{"old":"snapshot"}', encoding="utf-8")
+    tmp_sidecar = snap.with_name(snap.name + ".refresh.tmp")
+
+    # A valid fetched corpus = the real snapshot + a provenance block (the handler
+    # prints prov counts and load_corpus must accept it).
+    valid = json.loads((ROOT / corpus_rel).read_text())
+    valid["provenance"] = {
+        "extractor_mode": "deterministic", "extractor_cost_usd": 0.0,
+        "counts": {"papers": len(valid["papers"]), "claims": len(valid["claims"]),
+                   "injection_flagged_papers": 0, "dropped_claims_policy": 0}}
+
+    args = argparse.Namespace(refresh=True, source="contract", extractor=None,
+                              max_papers=None, mailto=None)
+
+    orig_root, orig_build = orch.ROOT, S.build_corpus_snapshot
+    try:
+        orch.ROOT = root
+
+        # (a) chmod gate: a read-only snapshot is refused with the exact remedy.
+        os.chmod(snap, 0o444)
+        S.build_corpus_snapshot = lambda *a, **k: valid
+        try:
+            orch.cmd_ground_refresh(args)
+            check("refresh: read-only snapshot refused", False, "no raise")
+        except orch.OrchestratorError as exc:
+            check("refresh: read-only snapshot refused",
+                  "chmod u+w" in str(exc) and "init --force" in str(exc))
+        os.chmod(snap, 0o644)
+
+        # (b) validate-before-overwrite: an unloadable fetch keeps the old file.
+        S.build_corpus_snapshot = lambda *a, **k: {"garbage": True}
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                orch.cmd_ground_refresh(args)
+            check("refresh: invalid corpus rejected", False, "no raise")
+        except orch.OrchestratorError as exc:
+            check("refresh: invalid corpus rejected",
+                  "old snapshot kept" in str(exc))
+        check("refresh: bad fetch left the old snapshot intact",
+              snap.read_text() == '{"old":"snapshot"}'
+              and not tmp_sidecar.exists())
+
+        # (c) success: atomic replace + the REVIEW-before-freeze gate is printed.
+        S.build_corpus_snapshot = lambda *a, **k: valid
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = orch.cmd_ground_refresh(args)
+        text = out.getvalue()
+        check("refresh: success returns 0", rc == 0)
+        check("refresh: snapshot replaced with the fetched corpus",
+              json.loads(snap.read_text()).get("corpus_id") == valid["corpus_id"]
+              and not tmp_sidecar.exists())
+        check("refresh: prints the REVIEW-before-freeze gate",
+              "REVIEW BEFORE FREEZE" in text
+              and "support-granting" in text
+              and "init --force" in text)
+    finally:
+        orch.ROOT, S.build_corpus_snapshot = orig_root, orig_build
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        for sub in ("a", "b", "c", "d"):
+        for sub in ("a", "b", "c", "d", "e"):
             (tmp / sub).mkdir()
         test_openalex_parse()
         test_s2_parse()
@@ -418,6 +495,7 @@ def main() -> int:
         test_empty_fetch_hard_fails()
         test_build_engine_provenance_assertion(tmp / "c")
         test_contract_validation(tmp / "d")
+        test_ground_refresh_handler(tmp / "e")
         test_no_campaign_time_network_or_import()
     print()
     if FAILS:

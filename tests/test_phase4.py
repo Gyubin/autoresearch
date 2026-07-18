@@ -275,7 +275,12 @@ def test_steering_order() -> None:
     plain = proposer._filtered_candidates(make_ctx(contract))
     first_kind = plain[0][0]
     first_move = move_of(HP[plain[0][1]], plain[0][2])
-    contra = [{"intervention": plain[0][1], "move": first_move,
+    # guidance keys speak the corpus intervention FAMILY, not the raw param —
+    # the proposer translates via PARAM_TO_FAMILY before the lookup (mirrors
+    # engine grounding). Keying these fixtures by raw param is exactly what
+    # masked the pre-fix steering bug, so they must speak families now.
+    contra = [{"intervention": orch.PARAM_TO_FAMILY[plain[0][1]],
+               "move": first_move,
                "stance": "contradicts", "evidence_ids": ["ev_x"]}]
     steered = proposer._filtered_candidates(
         make_ctx(contract, guidance=contra, refinement=ref))
@@ -289,7 +294,7 @@ def test_steering_order() -> None:
           behind[0] == first_kind, json.dumps(steered))
 
     support_kind, support_param, support_value = plain[3]
-    support = [{"intervention": support_param,
+    support = [{"intervention": orch.PARAM_TO_FAMILY[support_param],
                 "move": move_of(HP[support_param], support_value),
                 "stance": "supports", "evidence_ids": ["ev_y"]}]
     promoted = proposer._filtered_candidates(
@@ -305,6 +310,35 @@ def test_steering_order() -> None:
           == json.dumps(proposer._filtered_candidates(ctx)))
     check("steering: positive momentum outranks literature support",
           proposer._filtered_candidates(ctx)[0][1] == "max_iterations")
+
+
+def test_steering_uses_real_corpus_families() -> None:
+    """End-to-end guard: real move_guidance() is keyed by the corpus intervention
+    FAMILY, so the proposer must translate param->family (PARAM_TO_FAMILY) before
+    the lookup. The pre-fix code keyed by the raw param and left steering inert.
+    This drives the REAL corpus (not synthetic fixtures) — the only guard that
+    exercises the actual family namespace end-to-end."""
+    contract = orch.load_contract()
+    proposer = orch.HeuristicProposer()
+    guidance = _ground(make_engine()).move_guidance()
+
+    # Premise guard: the corpus must still support restart_strategy/increase —
+    # the one supported move that maps onto a realizable patcher candidate
+    # (restarts up). If the corpus drifts, fix this fixture rather than let the
+    # test go silently vacuous.
+    fams = {(g["intervention"], g["move"]): g["stance"] for g in guidance}
+    check("steering(e2e): corpus supports restart_strategy/increase",
+          fams.get(("restart_strategy", "increase")) == "supports")
+
+    plain = proposer._filtered_candidates(make_ctx(contract))
+    steered = proposer._filtered_candidates(
+        make_ctx(contract, guidance=guidance, refinement=make_refinement()))
+    # family translation lets the one supported move win the no-momentum sort;
+    # the raw-param bug would leave order == plain (restarts not at the front).
+    check("steering(e2e): real family guidance promotes the supported move",
+          steered[0][1] == "restarts" and plain[0][1] != "restarts")
+    check("steering(e2e): demote-not-remove keeps the candidate set intact",
+          {c[:2] for c in steered} == {c[:2] for c in plain})
 
 
 # ---------------------------------------------------------------------------
@@ -933,6 +967,7 @@ def main() -> int:
         test_momentum_blindness()
         test_move_guidance()
         test_steering_order()
+        test_steering_uses_real_corpus_families()
         test_legacy_equivalence()
         test_value_progression()
         test_explore_slots()

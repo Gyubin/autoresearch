@@ -252,3 +252,10 @@ sandbox:
   memory_mb: 512
   cpus: 1.0
   pids_limit: 128
+  # Trust policy for the seed-holding splits (gate/test). The candidate runs on
+  # held-out instances, so only `container` (which masks the seed file) yields a
+  # trust-grade score; `subprocess` can read the seed by absolute path and
+  # overfit. When true, the orchestrator FAILS on gate/report unless the backend
+  # is container. false (default) keeps the Docker-free workflow — it still warns
+  # loudly on every gate/report so the limitation is never silent.
+  require_container_for_trusted_splits: false

@@ -73,6 +73,12 @@ class SandboxConfig:
     memory_mb: int
     cpus: float
     pids_limit: int
+    # When True, the orchestrator refuses to score the seed-holding splits
+    # (gate/test) under a non-isolating backend instead of merely warning — the
+    # candidate runs on held-out instances, so only `container` (which masks the
+    # seed file) yields a trust-grade score. Default False keeps the Docker-free
+    # subprocess workflow working; the orchestrator warns loudly in that case.
+    require_container_for_trusted_splits: bool = False
 
 
 @dataclasses.dataclass(frozen=True)

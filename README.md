@@ -414,29 +414,48 @@ Phase 6b(실 문헌 API — `literature/sources.py`의 OpenAlex 어댑터 + `gro
 위에서 lexical로 결정론 유지) + Phase 6c(도메인을 Euclidean-TSP 휴리스틱으로 교체 —
 평가기가 hidden seed로 인스턴스 생성→solver에 좌표만 전달→tour 길이 재계산) 완료.
 
-### 실 문헌 corpus 새로고침 (`ground --refresh`)
+### 실 문헌 corpus 새로고침 (`ground --refresh`) — 네트워크 호스트 런북
 
-OpenAlex는 keyless(polite pool용 `mailto`), S2 키는 **env 전용**(`S2_API_KEY`,
-커밋 금지). 스냅샷은 refresh 때만 네트워크를 쓰고, 캠페인은 얼린 스냅샷을 결정적으로
-읽는다. 반-laundering 가드: 주입된 abstract가 `effect=improves`(유일한 support 부여
-스탠스)를 만들지 못하도록 개선 단서 없거나 인젝션 마커가 있으면 `conditional`로 강등.
+기계장치는 완비돼 있고 오프라인 테스트까지 됐다(핸들러 포함, `tests/test_phase6b.py`).
+**실제 fetch만 네트워크 호스트에서** 돈다. OpenAlex는 keyless(polite pool용 `mailto`),
+S2 키는 **env 전용**(`S2_API_KEY`, 계약·커밋 금지). 스냅샷은 refresh 때만 네트워크를 쓰고,
+캠페인은 얼린 스냅샷을 결정적으로 읽는다. 반-laundering 가드: 주입된 abstract가
+`effect=improves`(유일한 support 부여 스탠스)를 만들지 못하도록 개선 단서가 없거나 인젝션
+마커가 있으면 `conditional`로 강등.
+
+전제(네트워크 호스트): `api.openalex.org`/`api.semanticscholar.org` 아웃바운드 HTTPS,
+`extractor: claude`면 Claude SDK 자격.
 
 ```bash
+export S2_API_KEY=...            # s2 fetch 때만. env 전용, 계약/커밋 금지.
 chmod u+w literature/corpus/tsp_corpus.json
+# 옵션: --source openalex|s2|both|contract(기본)  --extractor claude|deterministic
+#       --max-papers N  --mailto you@example.com
 uv run python orchestrator.py ground --refresh --source openalex --mailto you@example.com
-# → support 부여 claim / injection-flagged 논문을 사람이 태그 diff 리뷰
-# research_contract.yaml 의 retriever 를 openalex 로 전환(chmod 후) 한 뒤:
-uv run python orchestrator.py init --force   # 매니페스트 재해시 + 재베이스라인
+git diff literature/corpus/tsp_corpus.json   # 사람이 태그 diff 리뷰
+# 리뷰 초점: effect=improves(support 부여) claim, injection_flagged 논문, dropped_claims_policy
+# (선택) 실 소스 캠페인이면 research_contract.yaml 의 retriever 를 openalex|s2 로 (chmod 후).
+#        lexical 로 두면 provenance assertion 생략 — 어떤 스냅샷이든 동작.
+uv run python orchestrator.py init --force   # 매니페스트 재해시 + 재베이스라인 (experiments/ 초기화)
 ```
+
+한계: `claude` extractor는 비결정론이라 실 refresh는 매번 새 diff(오프라인 경로만 재현
+가능); `_urllib_get` seam·실 SDK 호출은 실 네트워크에서만 최종 검증됨(오프라인 테스트
+커버 밖 — 핸들러의 chmod 게이트·validate-before-overwrite·REVIEW 출력만 오프라인 검증).
 
 ### 남은 후속 (정직한 한계)
 
-- `literature/corpus/tsp_corpus.json`은 큐레이션된 오프라인 스냅샷(provenance 비어
-  있음)이다. 실제 문헌 반영은 네트워크 호스트에서 `ground --refresh` → 태그 diff
-  사람 리뷰 → `init --force` 후에 완성된다.
-- 6c에서 patcher 하이퍼파라미터의 `evidence_steering`은 약하다: param↔family는
-  `engine.PARAM_TO_FAMILY`로 grounding엔 연결되나 orchestrator의 steering 조회는 아직
-  raw param을 써서 대부분 매칭되지 않는다(후속 정렬 대상).
-- solver가 held-out 인스턴스에서 실행되므로 **gate/test의 신뢰 채점은 `container`
-  백엔드에서만** 완전하다(subprocess는 seed 파일을 절대경로로 읽을 수 있음 — dev/smoke
-  전용). 자세한 위협 모델은 `tests/test_phase6c.py`의 canary 참고.
+- `literature/corpus/tsp_corpus.json`은 아직 큐레이션된 오프라인 스냅샷(provenance 비어
+  있음)이다. 실제 문헌 반영은 위 런북대로 네트워크 호스트에서 `ground --refresh` → 태그
+  diff 사람 리뷰 → `init --force` 후에 완성된다.
+- evidence_steering(patcher)은 정렬 완료: `orchestrator.rank()`/explore 필터가
+  `engine.PARAM_TO_FAMILY`로 raw param을 family로 변환해 문헌 조향이 실제로 동작한다
+  (`tests/test_phase4.py`의 실 corpus end-to-end 드릴로 검증). 남은 정직한 공백 하나 —
+  corpus는 `neighborhood_operator` 개선을 `add_operator` move로 태깅하는데 편집 표면
+  (`segment_max`)은 increase/decrease만 내므로 그 claim은 어떤 무브와도 매칭되지 않는다
+  ("무브 추가"에 해당하는 편집 표면이 없음).
+- gate/test는 held-out 인스턴스에서 solver를 돌리므로 신뢰 채점은 `container` 백엔드에서만
+  완전하다(subprocess는 seed 파일을 절대경로로 읽을 수 있음 — dev/smoke 전용). `subprocess`로
+  gate/report를 돌리면 orchestrator가 **항상 경고**하고,
+  `sandbox.require_container_for_trusted_splits: true`면 아예 fail-closed로 막는다.
+  report.md 헤더에도 신뢰 등급이 찍힌다. 자세한 위협 모델은 `tests/test_phase6c.py` canary 참고.
