@@ -1,5 +1,6 @@
 # AutoResearch — an executable autonomous-research loop
 
+[![CI](https://github.com/Gyubin/autoresearch/actions/workflows/ci.yml/badge.svg)](https://github.com/Gyubin/autoresearch/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue.svg)](pyproject.toml)
 
@@ -22,6 +23,34 @@ provenance *before* the agent swarm.**
 > "plausible-looking failure" from "verified progress."
 
 ---
+
+## How it works (at a glance)
+
+```mermaid
+flowchart TD
+    C[research_contract.yaml<br/>typed, immutable, protected]:::frozen --> P
+    L[literature engine<br/>claim-level evidence]:::opt -.-> P
+    M[search momentum<br/>recomputed from ledger] -.-> P
+    P[Proposer<br/>K diverse hypotheses] --> W[isolated git worktrees<br/>1 param edit each, run in parallel]
+    W --> SM[smoke rung<br/>successive halving]
+    SM --> DEV[dev split<br/>score vs incumbent]
+    DEV --> GATE{blind admission gate<br/>hidden gate split}
+    GATE -->|winner beats incumbent by margin| MERGE[ff-merge to main]
+    GATE -->|losers / no generalization| REJ[reject<br/>preserved on hyp/* branch + ledger]
+    MERGE --> INS[distill insight<br/>update momentum]
+    REJ --> INS
+    INS -->|next generation| P
+    MERGE --> REP[report<br/>test split · paired-bootstrap CI · claims · human approval gate]:::seal
+
+    classDef frozen fill:#eef,stroke:#88a;
+    classDef opt fill:#efe,stroke:#8a8,stroke-dasharray:4;
+    classDef seal fill:#fee,stroke:#a88;
+```
+
+The gate score never leaves the ledger — it never reaches the proposer, the insight
+memory, or any report (the **blindness** invariant). `main` accretes only
+gate-passing experiments; everything else is preserved as provenance on `hyp/*`
+branches. Dashed nodes are opt-in / offline-recomputed.
 
 ## Who this is for
 
@@ -57,6 +86,26 @@ uv run python tests/test_phase6.py                 # Phase 6a drill (sandbox arg
 uv run python tests/test_phase6b.py                # Phase 6b drill (real literature fetch / extraction / snapshot, offline fake HTTP/LLM)
 uv run python tests/test_phase6c.py                # Phase 6c drill (TSP feasibility / objective recompute / seed absence / blindness)
 ```
+
+### What a run looks like
+
+A generation proposes K hypotheses, runs them in parallel, and merges only the blind-gate
+winner (real output from the shipped Euclidean-TSP domain):
+
+```text
+— generation g0001 —
+  [r0001] restarts: 1 -> 2  mean_tour_length=6508432.5000  verdict=valid_positive  decision=ACCEPT
+  ...
+  [gate] candidates ['r0001'] -> winner r0001
+...
+generations executed: 3 (total 3; experiments 15); stop: requested generations done
+mean_tour_length (dev): baseline 6579300.425000 -> best 6351315.225000 (+3.47% relative)
+incumbent commit: 4796a8c70e16  stagnation: 0 generations
+```
+
+`orchestrator.py status` then prints the contract, metric, experiment/generation
+counts, incumbent, and any pending approval request. The end-to-end worked example
+lives in [docs/WORKBOOK.md](docs/WORKBOOK.md).
 
 Add `--gate pairwise` to keep admission (the scalar-epsilon rule) as-is but let a
 blind LLM judge panel pick the winner *among* candidates that already passed admission

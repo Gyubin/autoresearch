@@ -347,7 +347,7 @@ smoke 점수 상위 `max(min_keep, ceil(K·keep_fraction))` = `max(2, ceil(8·0.
 
 가설이 문헌 근거 위에 서게 한다. `literature/`는 **별도 통제 서비스**다:
 orchestrator를 import하지 않고, corpus 외 어떤 파일도 읽지 않으며, 런타임에
-아무것도 쓰지 않는다(폐포).
+아무것도 쓰지 않는다(폐쇄).
 
 - **오프라인 corpus** (`literature/corpus/tsp_corpus.json`, `tsp-heuristics-v1`):
   TSP 휴리스틱 논문 13편 / claim 13개. 모순쌍, citation-laundering 트랩,

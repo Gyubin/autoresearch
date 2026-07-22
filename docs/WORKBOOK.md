@@ -394,7 +394,7 @@ split, 30 seconds), and only the top `max(min_keep, ceil(K·keep_fraction))` =
 
 It makes hypotheses stand on literature grounding. `literature/` is a
 **separately governed service**: it does not import the orchestrator, reads no
-file other than the corpus, and writes nothing at runtime (hermetic).
+file other than the corpus, and writes nothing at runtime (closure).
 
 - **Offline corpus** (`literature/corpus/tsp_corpus.json`, `tsp-heuristics-v1`):
   13 TSP heuristics papers / 13 claims. Includes contradiction pairs,
