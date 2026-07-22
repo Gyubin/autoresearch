@@ -2,5 +2,5 @@ blank_issues_enabled: true
 contact_links:
   # After creating the GitHub repo, replace OWNER/REPO below with the real slug.
   - name: Security vulnerability
-    url: https://github.com/OWNER/REPO/security/advisories/new
+    url: https://github.com/Gyubin/autoresearch/security/advisories/new
     about: Please report security issues privately — see SECURITY.md, do not open a public issue.
