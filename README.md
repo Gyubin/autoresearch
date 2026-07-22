@@ -28,23 +28,25 @@ provenance *before* the agent swarm.**
 
 ```mermaid
 flowchart TD
-    C[research_contract.yaml<br/>typed, immutable, protected]:::frozen --> P
-    L[literature engine<br/>claim-level evidence]:::opt -.-> P
-    M[search momentum<br/>recomputed from ledger] -.-> P
-    P[Proposer<br/>K diverse hypotheses] --> W[isolated git worktrees<br/>1 param edit each, run in parallel]
-    W --> SM[smoke rung<br/>successive halving]
-    SM --> DEV[dev split<br/>score vs incumbent]
-    DEV --> GATE{blind admission gate<br/>hidden gate split}
-    GATE -->|winner beats incumbent by margin| MERGE[ff-merge to main]
-    GATE -->|losers / no generalization| REJ[reject<br/>preserved on hyp/* branch + ledger]
-    MERGE --> INS[distill insight<br/>update momentum]
+    C[research_contract.yaml<br/>typed, immutable, protected]:::base --> P
+    L[literature engine<br/>claim-level evidence]:::optin -.-> P
+    M[search momentum<br/>recomputed from ledger]:::optin -.-> P
+    P[Proposer<br/>K diverse hypotheses]:::base --> W[isolated git worktrees<br/>1 param edit each, run in parallel]:::base
+    W --> SM[smoke rung<br/>successive halving]:::base
+    SM --> DEV[dev split<br/>score vs incumbent]:::base
+    DEV --> GATE{blind admission gate<br/>hidden gate split}:::gate
+    GATE -->|winner beats incumbent by margin| MERGE[ff-merge to main]:::win
+    GATE -->|losers / no generalization| REJ[reject<br/>preserved on hyp/* branch + ledger]:::rej
+    MERGE --> INS[distill insight<br/>update momentum]:::base
     REJ --> INS
     INS -->|next generation| P
-    MERGE --> REP[report<br/>test split · paired-bootstrap CI · claims · human approval gate]:::seal
+    MERGE --> REP[report<br/>test split · paired-bootstrap CI · claims · human approval gate]:::base
 
-    classDef frozen fill:#eef,stroke:#88a;
-    classDef opt fill:#efe,stroke:#8a8,stroke-dasharray:4;
-    classDef seal fill:#fee,stroke:#a88;
+    classDef base fill:#3b5568,stroke:#8fb0c9,color:#ffffff;
+    classDef optin fill:#3b5568,stroke:#8fb0c9,color:#ffffff,stroke-dasharray:5 3;
+    classDef gate fill:#c88a2e,stroke:#e6b566,color:#ffffff;
+    classDef win fill:#2f8f5b,stroke:#69c294,color:#ffffff;
+    classDef rej fill:#b0544b,stroke:#dd9089,color:#ffffff;
 ```
 
 The gate score never leaves the ledger — it never reaches the proposer, the insight
