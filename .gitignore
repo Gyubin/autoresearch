@@ -23,5 +23,9 @@ docs/*.html
 .omc/
 .claude/
 .DS_Store
+# Editor swap / backup files
+*.swp
+*.swo
+*~
 # dead campaign seeds kept locally for exact-reproduction only — never commit
 docs/archive/*heldout_config.json
