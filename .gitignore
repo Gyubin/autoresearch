@@ -15,6 +15,9 @@ insight_memory.json
 # physically lack the held-out configuration.
 evaluation/heldout_config.json
 
+# Generated docs — rendered from the .md sources, not tracked.
+docs/*.html
+
 # Tooling / local
 .orchestrator.lock
 .omc/

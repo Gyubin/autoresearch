@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: lint + test drills
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install the pinned Python (from .python-version)
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Lint (ruff)
+        run: uvx ruff@0.15.22 check .
+
+      - name: Run test drills (offline, deterministic — no Docker, no network)
+        run: |
+          set -e
+          for p in 2 3 4 5 6 6b 6c; do
+            echo "::group::tests/test_phase${p}.py"
+            uv run python tests/test_phase${p}.py
+            echo "::endgroup::"
+          done

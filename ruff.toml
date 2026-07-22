@@ -1,0 +1,20 @@
+# Ruff configuration for AutoResearch.
+#
+# The core modules (orchestrator.py, literature/, assurance/, sandbox/,
+# evaluation/) are protected by protection/hashes.json and treated as frozen:
+# they cannot be edited without `orchestrator.py init --force` re-baselining the
+# whole campaign. A handful of pre-existing stylistic lints there are therefore
+# allowed rather than "fixed". Real correctness lints (undefined names, syntax
+# errors, etc.) stay enabled.
+line-length = 90
+target-version = "py313"
+
+[lint]
+ignore = [
+    "E402",  # module import not at top — intentional in src/train.py marker layout
+    "E701",  # multiple statements on one line — terse inline test fixtures
+    "E731",  # lambda assignment — tiny inline stubs in test fixtures
+    "E741",  # ambiguous variable name `l` — pre-existing in frozen core
+    "F401",  # unused import — pre-existing in frozen orchestrator.py
+    "F541",  # f-string without placeholders — pre-existing in frozen core
+]
