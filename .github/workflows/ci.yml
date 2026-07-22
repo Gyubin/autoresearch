@@ -30,6 +30,15 @@ jobs:
       - name: Lint (ruff)
         run: uvx ruff@0.15.22 check .
 
+      - name: Initialize campaign (baseline, held-out seeds, protection manifest)
+        # Same as the documented first run. Some drills execute the real
+        # evaluator, which needs the held-out seeds that `init` generates
+        # (evaluation/heldout_config.json is deliberately untracked).
+        run: |
+          git config user.email "ci@github.actions"
+          git config user.name "CI"
+          uv run python orchestrator.py init
+
       - name: Run test drills (offline, deterministic — no Docker, no network)
         run: |
           set -e
